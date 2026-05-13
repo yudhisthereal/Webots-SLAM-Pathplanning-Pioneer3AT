@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pioneer AT3 LiDAR Visualization</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🤖 Pioneer AT3 - LiDAR Visualization</h1>
+            <div id="connectionStatus" class="status disconnected">Disconnected</div>
+        </div>
+        
+        <div class="content">
+            <div class="visualization">
+                <canvas id="lidarCanvas" width="600" height="600"></canvas>
+            </div>
+            
+            <div class="info-panel">
+                <div class="info-section">
+                    <h3>📊 LiDAR Statistics</h3>
+                    <table class="info-table">
+                        <tr>
+                            <td class="info-label">Points:</td>
+                            <td class="info-value" id="numPoints">0</td>
+                        </tr>
+                        <tr>
+                            <td class="info-label">Range:</td>
+                            <td class="info-value" id="rangeLimit">0-0 m</td>
+                        </tr>
+                        <tr>
+                            <td class="info-label">Last Scan:</td>
+                            <td class="info-value" id="lastScan">0 s</td>
+                        </tr>
+                        <tr>
+                            <td class="info-label">Scan Rate:</td>
+                            <td class="info-value" id="scanRate">0 Hz</td>
+                        </tr>
+                    </table>
+                </div>
+                
+                <div class="info-section">
+                    <h3>🚗 Robot Status</h3>
+                    <table class="info-table">
+                        <tr>
+                            <td class="info-label">Left Speed:</td>
+                            <td class="info-value" id="leftSpeed">0.00</td>
+                        </tr>
+                        <tr>
+                            <td class="info-label">Right Speed:</td>
+                            <td class="info-value" id="rightSpeed">0.00</td>
+                        </tr>
+                        <tr>
+                            <td class="info-label">Mode:</td>
+                            <td class="info-value" id="robotMode">Auto</td>
+                        </tr>
+                        <tr>
+                            <td class="info-label">Battery:</td>
+                            <td class="info-value" id="battery">100%</td>
+                        </tr>
+                    </table>
+                </div>
+                
+                <div class="info-section">
+                    <h3>📍 Robot Position</h3>
+                    <table class="info-table">
+                        <tr>
+                            <td class="info-label">X:</td>
+                            <td class="info-value" id="posX">0.00 m</td>
+                        </tr>
+                        <tr>
+                            <td class="info-label">Y:</td>
+                            <td class="info-value" id="posY">0.00 m</td>
+                        </tr>
+                        <tr>
+                            <td class="info-label">Theta:</td>
+                            <td class="info-value" id="theta">0.00 °</td>
+                        </tr>
+                    </table>
+                </div>
+                <div class="info-section">
+                    <h3>🔍 Visualization</h3>
+                    <table class="info-table">
+                        <tr>
+                            <td class="info-label">Zoom Level:</td>
+                            <td class="info-value">
+                                <input type="range" id="zoomSlider" min="20" max="200" value="96" step="1">
+                            </td>
+                        </tr>
+                        <tr>
+                            <td class="info-label">Range:</td>
+                            <td class="info-value" id="zoomRange">2.5 m</td>
+                        </tr>
+                    </table>
+                </div>
+                <div class="controls">
+                    <button onclick="sendCommand('forward')">⬆️ Forward</button>
+                    <button onclick="sendCommand('backward')">⬇️ Backward</button>
+                    <button onclick="sendCommand('left')">⬅️ Left</button>
+                    <button onclick="sendCommand('right')">➡️ Right</button>
+                    <button onclick="sendCommand('stop')">⏹️ Stop</button>
+                    <button onclick="sendCommand('auto')">🤖 Auto Mode</button>
+                </div>
+                
+                <div class="connection-controls">
+                    <h3>🔌 Connection Settings</h3>
+                    <input type="text" id="wsUrl" placeholder="ws://localhost:8765" value="ws://localhost:8766">
+                    <button onclick="connectWebSocket()">Connect</button>
+                    <button onclick="disconnectWebSocket()">Disconnect</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script src="script.js"></script>
+</body>
+</html>
