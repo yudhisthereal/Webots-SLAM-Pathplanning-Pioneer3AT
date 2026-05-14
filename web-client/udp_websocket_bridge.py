@@ -39,9 +39,10 @@ SCAN_MATCH_STRIDE = 3
 SCAN_MATCH_MIN_FEATURES = 150
 SCAN_MATCH_TRANSLATION_RANGE = 0.20
 SCAN_MATCH_TRANSLATION_STEP = 0.05
-SCAN_MATCH_THETA_RANGE = math.radians(8)
-SCAN_MATCH_THETA_STEP = math.radians(2)
-SCAN_MATCH_MIN_IMPROVEMENT = 0.03
+SCAN_MATCH_THETA_RANGE = math.radians(4)  # Reduced from 8 degrees for more stability
+SCAN_MATCH_THETA_STEP = math.radians(1)   # Reduced from 2 degrees
+SCAN_MATCH_MIN_IMPROVEMENT = 0.05  # Increased from 0.03 for theta corrections
+SCAN_MATCH_THETA_MIN_IMPROVEMENT = 0.10  # Minimum improvement threshold for accepting theta changes
 
 def wrap_angle(angle):
     """Wrap an angle to [-pi, pi]."""
@@ -62,7 +63,7 @@ print("=" * 60)
 
 
 class OccupancyGrid:
-    """2D occupancy grid map using log-odds"""
+    """2D occupancy grid map using log-odds with dynamic expansion"""
 
     def __init__(self, width, height, resolution):
         self.width = width
@@ -76,6 +77,89 @@ class OccupancyGrid:
 
         # For visualization
         self.occupancy = np.full((height, width), -1, dtype=np.int8)
+
+    def expand_if_needed(self, robot_x, robot_y):
+        """Expand grid if robot is near boundaries"""
+        gx, gy = self.world_to_grid(robot_x, robot_y)
+        
+        # If robot is within 10% of edge, expand
+        expand_threshold = int(0.1 * self.width)
+        needs_expand = False
+        expand_direction = None
+        
+        if gx < expand_threshold:
+            needs_expand = True
+            expand_direction = 'left'
+        elif gx >= self.width - expand_threshold:
+            needs_expand = True
+            expand_direction = 'right'
+        elif gy < expand_threshold:
+            needs_expand = True
+            expand_direction = 'bottom'
+        elif gy >= self.height - expand_threshold:
+            needs_expand = True
+            expand_direction = 'top'
+        
+        if needs_expand:
+            self._expand_grid(expand_direction)
+            return True
+        return False
+
+    def _expand_grid(self, direction):
+        """Expand grid in specified direction"""
+        old_width = self.width
+        old_height = self.height
+        
+        if direction == 'left':
+            new_width = int(old_width * 1.5)
+            new_height = old_height
+            self.width = new_width
+            self.height = new_height
+            
+            # Expand left
+            offset_x = int((new_width - old_width) / 2)
+            offset_y = 0
+        elif direction == 'right':
+            new_width = int(old_width * 1.5)
+            new_height = old_height
+            self.width = new_width
+            self.height = new_height
+            
+            offset_x = int((new_width - old_width) / 2)
+            offset_y = 0
+        elif direction == 'bottom':
+            new_width = old_width
+            new_height = int(old_height * 1.5)
+            self.width = new_width
+            self.height = new_height
+            
+            offset_x = 0
+            offset_y = int((new_height - old_height) / 2)
+        elif direction == 'top':
+            new_width = old_width
+            new_height = int(old_height * 1.5)
+            self.width = new_width
+            self.height = new_height
+            
+            offset_x = 0
+            offset_y = int((new_height - old_height) / 2)
+        
+        # Update origin
+        self.origin_x -= offset_x * self.resolution
+        self.origin_y -= offset_y * self.resolution
+        
+        # Create new grids
+        new_log_odds = np.zeros((self.height, self.width), dtype=np.float32)
+        new_occupancy = np.full((self.height, self.width), -1, dtype=np.int8)
+        
+        # Copy old data to new grid
+        new_log_odds[offset_y:offset_y+old_height, offset_x:offset_x+old_width] = self.log_odds
+        new_occupancy[offset_y:offset_y+old_height, offset_x:offset_x+old_width] = self.occupancy
+        
+        self.log_odds = new_log_odds
+        self.occupancy = new_occupancy
+        
+        print(f"[Map] Expanded to {self.width}×{self.height} cells ({direction})")
 
     def world_to_grid(self, x, y):
         """Convert world coordinates to grid indices"""
@@ -153,41 +237,90 @@ class OccupancyGrid:
         return score / valid_points
 
     def refine_pose(self, robot_x, robot_y, robot_theta, ranges, angles):
-        """Refine the supplied pose with a small local scan-matching search."""
+        """Refine the supplied pose with a small local scan-matching search.
+        
+        Prioritizes translation refinement over rotation refinement to prevent
+        theta drift from creating slanted walls in the occupancy grid.
+        """
         if not self.is_ready_for_scan_matching():
             return robot_x, robot_y, robot_theta, 0.0
 
         best_pose = (robot_x, robot_y, robot_theta)
         best_score = self.score_scan_pose(robot_x, robot_y, robot_theta, ranges, angles)
 
-        search_levels = [
-            (SCAN_MATCH_TRANSLATION_RANGE, SCAN_MATCH_TRANSLATION_STEP, SCAN_MATCH_THETA_RANGE, SCAN_MATCH_THETA_STEP),
-            (SCAN_MATCH_TRANSLATION_RANGE * 0.5, SCAN_MATCH_TRANSLATION_STEP * 0.5, SCAN_MATCH_THETA_RANGE * 0.5, SCAN_MATCH_THETA_STEP * 0.5),
-        ]
+        # Level 1: Coarse translation search (NO theta adjustment)
+        dx_values = np.arange(-SCAN_MATCH_TRANSLATION_RANGE, SCAN_MATCH_TRANSLATION_RANGE + 1e-6, SCAN_MATCH_TRANSLATION_STEP)
+        dy_values = np.arange(-SCAN_MATCH_TRANSLATION_RANGE, SCAN_MATCH_TRANSLATION_RANGE + 1e-6, SCAN_MATCH_TRANSLATION_STEP)
 
-        for translation_range, translation_step, theta_range, theta_step in search_levels:
-            base_x, base_y, base_theta = best_pose
+        for dx in dx_values:
+            for dy in dy_values:
+                candidate_x = robot_x + float(dx)
+                candidate_y = robot_y + float(dy)
+                candidate_score = self.score_scan_pose(candidate_x, candidate_y, robot_theta, ranges, angles)
 
-            dx_values = np.arange(-translation_range, translation_range + 1e-6, translation_step)
-            dy_values = np.arange(-translation_range, translation_range + 1e-6, translation_step)
-            dtheta_values = np.arange(-theta_range, theta_range + 1e-6, theta_step)
+                if candidate_score > best_score:
+                    best_score = candidate_score
+                    best_pose = (candidate_x, candidate_y, robot_theta)
+
+        # Level 2: Fine translation search
+        if best_pose != (robot_x, robot_y, robot_theta):
+            base_x, base_y, _ = best_pose
+            dx_values = np.arange(-SCAN_MATCH_TRANSLATION_RANGE * 0.5, SCAN_MATCH_TRANSLATION_RANGE * 0.5 + 1e-6, SCAN_MATCH_TRANSLATION_STEP * 0.5)
+            dy_values = np.arange(-SCAN_MATCH_TRANSLATION_RANGE * 0.5, SCAN_MATCH_TRANSLATION_RANGE * 0.5 + 1e-6, SCAN_MATCH_TRANSLATION_STEP * 0.5)
 
             for dx in dx_values:
                 for dy in dy_values:
-                    for dtheta in dtheta_values:
-                        candidate_x = base_x + float(dx)
-                        candidate_y = base_y + float(dy)
-                        candidate_theta = wrap_angle(base_theta + float(dtheta))
-                        candidate_score = self.score_scan_pose(candidate_x, candidate_y, candidate_theta, ranges, angles)
+                    candidate_x = base_x + float(dx)
+                    candidate_y = base_y + float(dy)
+                    candidate_score = self.score_scan_pose(candidate_x, candidate_y, robot_theta, ranges, angles)
 
-                        if candidate_score > best_score:
-                            best_score = candidate_score
-                            best_pose = (candidate_x, candidate_y, candidate_theta)
+                    if candidate_score > best_score:
+                        best_score = candidate_score
+                        best_pose = (candidate_x, candidate_y, robot_theta)
+
+        # Level 3: Small theta refinement (only if translation search improved things significantly)
+        translation_score = best_score
+        base_x, base_y, base_theta = best_pose
+        dtheta_values = np.arange(-SCAN_MATCH_THETA_RANGE, SCAN_MATCH_THETA_RANGE + 1e-6, SCAN_MATCH_THETA_STEP)
+
+        for dtheta in dtheta_values:
+            candidate_theta = wrap_angle(base_theta + float(dtheta))
+            candidate_score = self.score_scan_pose(base_x, base_y, candidate_theta, ranges, angles)
+
+            # Only accept theta if improvement is significant (to prevent theta drift)
+            if candidate_score > best_score + SCAN_MATCH_THETA_MIN_IMPROVEMENT:
+                best_score = candidate_score
+                best_pose = (base_x, base_y, candidate_theta)
 
         return best_pose[0], best_pose[1], best_pose[2], best_score
 
+    def mark_occupied_with_neighbors(self, gx, gy):
+        """Mark a cell and its 8 neighbors as occupied for thickness and error tolerance"""
+        if not (0 <= gx < self.width and 0 <= gy < self.height):
+            return
+        
+        # Mark center cell
+        self.log_odds[gy, gx] += LOG_ODDS_OCCUPIED
+        self.log_odds[gy, gx] = np.clip(self.log_odds[gy, gx], MIN_LOG_ODDS, MAX_LOG_ODDS)
+        
+        # Mark 8 neighbors (4 cardinal + 4 diagonal)
+        for dx in [-1, 0, 1]:
+            for dy in [-1, 0, 1]:
+                if dx == 0 and dy == 0:
+                    continue  # Skip center (already marked)
+                
+                nx, ny = gx + dx, gy + dy
+                if 0 <= nx < self.width and 0 <= ny < self.height:
+                    # Add less weight to neighbors (75% of center weight)
+                    neighbor_weight = LOG_ODDS_OCCUPIED * 0.75
+                    self.log_odds[ny, nx] += neighbor_weight
+                    self.log_odds[ny, nx] = np.clip(self.log_odds[ny, nx], MIN_LOG_ODDS, MAX_LOG_ODDS)
+
     def update(self, robot_x, robot_y, robot_theta, ranges, angles):
         """Update occupancy grid with new LiDAR scan"""
+        # Expand grid if robot is near boundaries
+        self.expand_if_needed(robot_x, robot_y)
+        
         for i in range(len(ranges)):
             r = ranges[i]
             angle = angles[i]
@@ -199,12 +332,9 @@ class OccupancyGrid:
             end_x = robot_x + r * math.cos(robot_theta + angle)
             end_y = robot_y + r * math.sin(robot_theta + angle)
 
-            # Mark endpoint as occupied
+            # Mark endpoint as occupied with neighbors for thickness
             gx, gy = self.world_to_grid(end_x, end_y)
-            if 0 <= gx < self.width and 0 <= gy < self.height:
-                self.log_odds[gy, gx] += LOG_ODDS_OCCUPIED
-                self.log_odds[gy, gx] = np.clip(self.log_odds[gy, gx],
-                                                 MIN_LOG_ODDS, MAX_LOG_ODDS)
+            self.mark_occupied_with_neighbors(gx, gy)
 
             # Ray casting for free space
             steps = int(r / self.resolution)
@@ -326,10 +456,27 @@ async def forward_udp_to_websocket():
                             )
 
                             predicted_score = map_grid.score_scan_pose(predicted_x, predicted_y, predicted_theta, ranges, angles)
+                            
+                            # Accept refinement only if improvement is significant
                             if match_score >= predicted_score + SCAN_MATCH_MIN_IMPROVEMENT:
-                                slam_x = refined_x
-                                slam_y = refined_y
-                                slam_theta = refined_theta
+                                # Check if theta changed significantly - be conservative
+                                theta_delta = abs(wrap_angle(refined_theta - predicted_theta))
+                                if theta_delta > math.radians(0.5):
+                                    # Only accept large theta changes if they're really beneficial
+                                    if match_score >= predicted_score + SCAN_MATCH_THETA_MIN_IMPROVEMENT:
+                                        slam_x = refined_x
+                                        slam_y = refined_y
+                                        slam_theta = refined_theta
+                                    else:
+                                        # Accept translation but keep theta from odometry
+                                        slam_x = refined_x
+                                        slam_y = refined_y
+                                        slam_theta = predicted_theta
+                                else:
+                                    # Small theta change, accept it
+                                    slam_x = refined_x
+                                    slam_y = refined_y
+                                    slam_theta = refined_theta
                             else:
                                 slam_x = predicted_x
                                 slam_y = predicted_y

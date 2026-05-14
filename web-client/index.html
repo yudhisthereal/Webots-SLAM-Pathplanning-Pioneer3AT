@@ -23,14 +23,24 @@
                 <div class="view-frame">
                     <section id="radarPanel" class="view-panel active">
                         <canvas id="radarCanvas" width="720" height="540"></canvas>
+                        <div id="radarVisualization" class="visualization-panel">
+                            <div class="visualization-content">
+                                <span class="zoom-label">Zoom:</span>
+                                <input type="range" id="zoomSlider" min="20" max="200" value="96" step="1">
+                                <span class="zoom-range" id="zoomRange">2.5 m</span>
+                            </div>
+                        </div>
                     </section>
 
                     <section id="mapPanel" class="view-panel">
                         <div class="map-toolbar">
                             <button onclick="resetMapView()">Reset View</button>
                             <button onclick="centerMapOnRobot()">Center Robot</button>
-                            <button onclick="zoomMap(1.2)">Zoom In</button>
-                            <button onclick="zoomMap(1 / 1.2)">Zoom Out</button>
+                        </div>
+                        <div class="map-zoom-container">
+                            <span class="zoom-label">Zoom:</span>
+                            <input type="range" id="mapZoomSlider" min="10" max="180" value="45" step="1">
+                            <span class="zoom-value" id="mapZoomValue">45</span>
                         </div>
                         <canvas id="mapCanvas" width="720" height="540"></canvas>
                         <div class="map-hint">Drag to pan • Scroll to zoom</div>
@@ -101,21 +111,6 @@
                         <tr>
                             <td class="info-label">Linear Vel:</td>
                             <td class="info-value" id="linearVel">0.00 m/s</td>
-                        </tr>
-                    </table>
-                </div>
-                <div class="info-section">
-                    <h3>🔍 Visualization</h3>
-                    <table class="info-table">
-                        <tr>
-                            <td class="info-label">Zoom Level:</td>
-                            <td class="info-value">
-                                <input type="range" id="zoomSlider" min="20" max="200" value="96" step="1">
-                            </td>
-                        </tr>
-                        <tr>
-                            <td class="info-label">Range:</td>
-                            <td class="info-value" id="zoomRange">2.5 m</td>
                         </tr>
                     </table>
                 </div>

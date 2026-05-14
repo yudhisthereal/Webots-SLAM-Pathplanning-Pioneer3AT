@@ -95,6 +95,18 @@ function initZoomSlider() {
     slider.addEventListener('input', function(event) {
         setRadarZoom(parseFloat(event.target.value));
     });
+
+    const mapSlider = document.getElementById('mapZoomSlider');
+    if (mapSlider) {
+        mapSlider.addEventListener('input', function(event) {
+            const zoomValue = parseFloat(event.target.value);
+            mapView.zoom = zoomValue;
+            document.getElementById('mapZoomValue').textContent = zoomValue.toFixed(0);
+            if (activeView === 'map') {
+                renderMapView();
+            }
+        });
+    }
 }
 
 function showView(viewName) {
