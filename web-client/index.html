@@ -14,8 +14,28 @@
         </div>
         
         <div class="content">
-            <div class="visualization">
-                <canvas id="lidarCanvas" width="600" height="600"></canvas>
+            <div class="main-panel">
+                <div class="view-tabs">
+                    <button id="radarTab" class="tab-button active" onclick="showView('radar')">Radar</button>
+                    <button id="mapTab" class="tab-button" onclick="showView('map')">Map</button>
+                </div>
+
+                <div class="view-frame">
+                    <section id="radarPanel" class="view-panel active">
+                        <canvas id="radarCanvas" width="720" height="540"></canvas>
+                    </section>
+
+                    <section id="mapPanel" class="view-panel">
+                        <div class="map-toolbar">
+                            <button onclick="resetMapView()">Reset View</button>
+                            <button onclick="centerMapOnRobot()">Center Robot</button>
+                            <button onclick="zoomMap(1.2)">Zoom In</button>
+                            <button onclick="zoomMap(1 / 1.2)">Zoom Out</button>
+                        </div>
+                        <canvas id="mapCanvas" width="720" height="540"></canvas>
+                        <div class="map-hint">Drag to pan • Scroll to zoom</div>
+                    </section>
+                </div>
             </div>
             
             <div class="info-panel">

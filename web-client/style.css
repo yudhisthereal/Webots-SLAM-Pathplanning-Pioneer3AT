@@ -59,9 +59,10 @@ body {
     display: flex;
     flex-direction: row;
     flex-wrap: wrap;
+    align-items: stretch;
 }
 
-.visualization {
+.main-panel {
     flex: 2;
     min-width: 500px;
     padding: 20px;
@@ -75,6 +76,41 @@ body {
     background: #f5f6fa;
 }
 
+/* View tabs */
+.view-tabs {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 15px;
+}
+
+.tab-button {
+    background: rgba(255, 255, 255, 0.08);
+    color: #e5e7ff;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    padding: 10px 18px;
+    border-radius: 999px;
+    font-weight: 600;
+    letter-spacing: 0.2px;
+}
+
+.tab-button.active {
+    background: linear-gradient(135deg, #667eea 0%, #7c4dff 100%);
+    border-color: transparent;
+    box-shadow: 0 8px 24px rgba(102, 126, 234, 0.35);
+}
+
+.view-frame {
+    position: relative;
+}
+
+.view-panel {
+    display: none;
+}
+
+.view-panel.active {
+    display: block;
+}
+
 canvas {
     width: 100%;
     height: auto;
@@ -82,6 +118,33 @@ canvas {
     border-radius: 10px;
     box-shadow: 0 5px 20px rgba(0,0,0,0.5);
     display: block;
+}
+
+#mapCanvas {
+    cursor: grab;
+}
+
+#mapCanvas:active {
+    cursor: grabbing;
+}
+
+.map-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 10px;
+}
+
+.map-toolbar button {
+    padding: 8px 14px;
+    font-size: 13px;
+}
+
+.map-hint {
+    margin-top: 8px;
+    color: #a8a8b6;
+    font-size: 12px;
+    text-align: right;
 }
 
 .info-section {
@@ -235,7 +298,7 @@ input:focus {
 
 /* Responsive Design */
 @media (max-width: 1024px) {
-    .visualization {
+    .main-panel {
         min-width: 400px;
     }
     
@@ -250,6 +313,11 @@ input:focus {
     
     .info-value {
         font-size: 14px;
+    }
+
+    .tab-button {
+        padding: 8px 14px;
+        font-size: 13px;
     }
 }
 
@@ -266,7 +334,7 @@ input:focus {
         flex-direction: column;
     }
     
-    .visualization {
+    .main-panel {
         min-width: auto;
         padding: 15px;
     }
@@ -298,6 +366,24 @@ input:focus {
     .info-section h3 {
         font-size: 14px;
         margin-bottom: 10px;
+    }
+
+    .view-tabs {
+        gap: 8px;
+    }
+
+    .tab-button {
+        padding: 8px 12px;
+        font-size: 12px;
+    }
+
+    .map-toolbar {
+        gap: 6px;
+    }
+
+    .map-toolbar button {
+        padding: 7px 10px;
+        font-size: 12px;
     }
     
     .info-table td {
@@ -336,6 +422,10 @@ input:focus {
     button {
         padding: 8px;
         font-size: 11px;
+    }
+
+    .tab-button {
+        padding: 7px 10px;
     }
     
     .info-value {
