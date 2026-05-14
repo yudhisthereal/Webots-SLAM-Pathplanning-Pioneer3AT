@@ -202,6 +202,11 @@ async def forward_udp_to_websocket():
                             "robot_x": robot_x,
                             "robot_y": robot_y,
                             "robot_theta": robot_theta,
+                            "left_speed": scan_data.get('left_speed', 0),
+                            "right_speed": scan_data.get('right_speed', 0),
+                            "auto_navigate": scan_data.get('auto_navigate', True),
+                            "linear_vel": scan_data.get('linear_vel', 0),
+                            "angular_vel": scan_data.get('angular_vel', 0),
                         }
                         
                         # Send map periodically (not every frame for performance)

@@ -313,30 +313,43 @@ function connectWebSocket() {
             let data = JSON.parse(event.data);
             
             if (data.type === 'lidar_scan') {
-                // Update data
+                // LiDAR data
                 currentRanges = data.ranges;
                 currentAngles = data.angles;
                 maxRange = data.max_range;
+                
+                // Robot position (from odometry)
                 robotX = data.robot_x || 0;
                 robotY = data.robot_y || 0;
                 robotTheta = data.robot_theta || 0;
                 
-                // Update display
+                // Robot status - NOW READING FROM LIDAR_SCAN
+                let leftSpeed = data.left_speed !== undefined ? data.left_speed : 0;
+                let rightSpeed = data.right_speed !== undefined ? data.right_speed : 0;
+                let autoMode = data.auto_navigate !== undefined ? data.auto_navigate : true;
+                let linearVel = data.linear_vel !== undefined ? data.linear_vel : 0;
+                
+                // Update visualization
                 updateVisualization();
                 
-                // Update stats panel
+                // Update STATS panel (LiDAR Statistics)
                 document.getElementById('numPoints').innerHTML = data.num_points.toLocaleString();
                 document.getElementById('rangeLimit').innerHTML = `${data.min_range.toFixed(1)}-${data.max_range.toFixed(1)} m`;
                 document.getElementById('lastScan').innerHTML = data.timestamp.toFixed(2) + ' s';
+                updateScanRate(data.timestamp);
+                
+                // Update ROBOT STATUS panel
+                document.getElementById('leftSpeed').innerHTML = leftSpeed.toFixed(2) + ' m/s';
+                document.getElementById('rightSpeed').innerHTML = rightSpeed.toFixed(2) + ' m/s';
+                document.getElementById('robotMode').innerHTML = autoMode ? '🤖 Auto' : '🎮 Manual';
+                
+                // Update ROBOT POSITION panel
                 document.getElementById('posX').innerHTML = robotX.toFixed(2) + ' m';
                 document.getElementById('posY').innerHTML = robotY.toFixed(2) + ' m';
                 document.getElementById('theta').innerHTML = (robotTheta * 180 / Math.PI).toFixed(1) + ' °';
+                document.getElementById('linearVel').innerHTML = linearVel.toFixed(2) + ' m/s';
                 
-                if (data.linear_vel !== undefined) {
-                    document.getElementById('linearVel').innerHTML = data.linear_vel.toFixed(2) + ' m/s';
-                }
-                
-                updateScanRate(data.timestamp);
+                console.log(`[Update] Pos: (${robotX.toFixed(2)}, ${robotY.toFixed(2)}), Speed: ${leftSpeed.toFixed(2)} m/s, Mode: ${autoMode ? 'AUTO' : 'MANUAL'}`);
                 
                 // Update map if provided
                 if (data.map) {
@@ -344,9 +357,14 @@ function connectWebSocket() {
                 }
                 
             } else if (data.type === 'robot_info') {
-                document.getElementById('leftSpeed').innerHTML = data.left_speed.toFixed(2) + ' m/s';
-                document.getElementById('rightSpeed').innerHTML = data.right_speed.toFixed(2) + ' m/s';
+                // Fallback for robot_info messages (backup)
+                document.getElementById('leftSpeed').innerHTML = (data.left_speed || 0).toFixed(2) + ' m/s';
+                document.getElementById('rightSpeed').innerHTML = (data.right_speed || 0).toFixed(2) + ' m/s';
                 document.getElementById('robotMode').innerHTML = data.auto_navigate ? '🤖 Auto' : '🎮 Manual';
+                document.getElementById('posX').innerHTML = (data.x || 0).toFixed(2) + ' m';
+                document.getElementById('posY').innerHTML = (data.y || 0).toFixed(2) + ' m';
+                document.getElementById('theta').innerHTML = ((data.theta || 0) * 180 / Math.PI).toFixed(1) + ' °';
+                document.getElementById('linearVel').innerHTML = (data.linear_vel || 0).toFixed(2) + ' m/s';
             }
         } catch (e) {
             console.error('[WebSocket] Parse error:', e);

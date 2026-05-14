@@ -241,6 +241,9 @@ int main(int argc, char **argv) {
             json << "\"robot_x\":" << robotX << ",";
             json << "\"robot_y\":" << robotY << ",";
             json << "\"robot_theta\":" << robotTheta << ",";
+            json << "\"left_speed\":" << leftSpeed << ",";
+            json << "\"right_speed\":" << rightSpeed << ",";
+            json << "\"auto_navigate\":" << (autoNavigate ? "true" : "false") << ",";
             json << "\"linear_vel\":" << linearVel << ",";
             json << "\"angular_vel\":" << angularVel << ",";
             
@@ -268,11 +271,17 @@ int main(int argc, char **argv) {
             // Send UDP packet
             udp.send(json.str());
             
-            // Simple obstacle avoidance using odometry + LiDAR
+            // Smart obstacle avoidance using left/right comparison
             if (autoNavigate && backLeftMotor && backRightMotor) {
                 int centerIdx = (horizontalResolution / downsample) / 2;
-                float minFrontRange = maxRange;
+                int leftIdx = centerIdx - 20;   // 20 points left of center (~60 degrees)
+                int rightIdx = centerIdx + 20;  // 20 points right of center (~60 degrees)
                 
+                float minFrontRange = maxRange;
+                float minLeftRange = maxRange;
+                float minRightRange = maxRange;
+                
+                // Sample front, left, and right regions
                 for (int i = centerIdx - 10; i < centerIdx + 10 && i < numPoints; i++) {
                     int origIdx = i * downsample;
                     if (origIdx < horizontalResolution) {
@@ -283,24 +292,77 @@ int main(int argc, char **argv) {
                     }
                 }
                 
-                if (minFrontRange < 0.5) {
-                    leftSpeed = -0.3;
-                    rightSpeed = 0.3;
-                } else if (minFrontRange < 1.0) {
-                    leftSpeed = 0.15;
-                    rightSpeed = 0.1;
-                } else {
-                    leftSpeed = 1.0;
-                    rightSpeed = 1.0;
+                // Check left side (30 to 90 degrees left of center)
+                for (int i = leftIdx - 15; i < leftIdx + 15 && i < numPoints; i++) {
+                    if (i < 0) continue;
+                    int origIdx = i * downsample;
+                    if (origIdx < horizontalResolution) {
+                        float range = rangeImage[origIdx];
+                        if (range > minRange && range < minLeftRange) {
+                            minLeftRange = range;
+                        }
+                    }
                 }
                 
+                // Check right side (30 to 90 degrees right of center)
+                for (int i = rightIdx - 15; i < rightIdx + 15 && i < numPoints; i++) {
+                    if (i >= numPoints) continue;
+                    int origIdx = i * downsample;
+                    if (origIdx < horizontalResolution) {
+                        float range = rangeImage[origIdx];
+                        if (range > minRange && range < minRightRange) {
+                            minRightRange = range;
+                        }
+                    }
+                }
+                
+                // Obstacle avoidance logic
+                if (minFrontRange < 0.5) {
+                    // Obstacle too close - turn toward the side with more space
+                    if (minLeftRange > minRightRange) {
+                        // More space on left - turn left
+                        leftSpeed = -0.3;
+                        rightSpeed = 0.3;
+                        cout << "[Avoid] Turning LEFT - Front:" << minFrontRange 
+                             << "m, Left:" << minLeftRange << "m, Right:" << minRightRange << "m" << endl;
+                    } else {
+                        // More space on right - turn right
+                        leftSpeed = 0.3;
+                        rightSpeed = -0.3;
+                        cout << "[Avoid] Turning RIGHT - Front:" << minFrontRange 
+                             << "m, Left:" << minLeftRange << "m, Right:" << minRightRange << "m" << endl;
+                    }
+                } 
+                else if (minFrontRange < 1.0) {
+                    // Getting close - slow down and turn slightly toward open space
+                    float turn_intensity = 0.2;  // How aggressively to turn (0.2 = gentle turn)
+                    
+                    if (minLeftRange > minRightRange) {
+                        // More space on left - gentle left turn
+                        leftSpeed = 0.1;                                    // Slow left wheel
+                        rightSpeed = 0.1 + turn_intensity;                  // Faster right wheel
+                    } else {
+                        // More space on right - gentle right turn
+                        leftSpeed = 0.1 + turn_intensity;                   // Faster left wheel
+                        rightSpeed = 0.1;                                   // Slow right wheel
+                    }
+                    cout << "[Avoid] Slowing - Front:" << minFrontRange << "m, turning " 
+                         << (minLeftRange > minRightRange ? "LEFT" : "RIGHT") << endl;
+                } 
+                else {
+                    // Clear path - go forward
+                    leftSpeed = 0.4;
+                    rightSpeed = 0.4;
+                }
+                
+                // Apply motor commands
                 backLeftMotor->setVelocity(leftSpeed);
                 backRightMotor->setVelocity(rightSpeed);
                 frontLeftMotor->setVelocity(leftSpeed);
                 frontRightMotor->setVelocity(rightSpeed);
             }
         }
-        
+                    
         // Send robot info every 2 seconds
         if (iteration % (int)(2000 / timeStep) == 0 && iteration > 0) {
             stringstream info;
