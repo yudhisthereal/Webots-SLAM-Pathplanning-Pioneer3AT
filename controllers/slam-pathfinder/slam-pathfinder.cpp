@@ -205,6 +205,11 @@ int main(int argc, char **argv) {
     double leftSpeed = 0.0;
     double rightSpeed = 0.0;
     bool autoNavigate = true;
+    // Test rotation mode: when true, overrides autoNavigate and runs
+    // in-place right/left rotations for 5s each (repeat). Set to true to run sanity check.
+    bool testRotationMode = true; // <-- set true for theta sanity test
+    double testTurnVelocity = 0.35; // wheel velocity for in-place turn (rad/s)
+    // double testStartTime = robot->getTime();
     int iteration = 0;
     int downsample = 3;
     
@@ -240,7 +245,7 @@ int main(int argc, char **argv) {
             json << "\"fov\":" << fov << ",";
             json << "\"robot_x\":" << robotX << ",";
             json << "\"robot_y\":" << robotY << ",";
-            json << "\"robot_theta\":" << robotTheta << ",";
+            json << "\"robot_theta\":" << -robotTheta << ",";
             json << "\"left_speed\":" << leftSpeed << ",";
             json << "\"right_speed\":" << rightSpeed << ",";
             json << "\"auto_navigate\":" << (autoNavigate ? "true" : "false") << ",";
@@ -271,8 +276,24 @@ int main(int argc, char **argv) {
             // Send UDP packet
             udp.send(json.str());
             
-            // Smart obstacle avoidance using left/right comparison
-            if (autoNavigate && backLeftMotor && backRightMotor) {
+                // Test rotation override
+                if (testRotationMode && backLeftMotor && backRightMotor) {
+                    // double elapsed = currentTime - testStartTime;
+                    // double phase = fmod(elapsed, 10.0); // 0-10s cycle
+
+                    leftSpeed = -testTurnVelocity;
+                    rightSpeed = testTurnVelocity;
+
+                    // leftSpeed = testTurnVelocity;
+                    // rightSpeed = -testTurnVelocity;
+
+                    // Apply motor commands for test
+                    backLeftMotor->setVelocity(leftSpeed);
+                    backRightMotor->setVelocity(rightSpeed);
+                    frontLeftMotor->setVelocity(leftSpeed);
+                    frontRightMotor->setVelocity(rightSpeed);
+
+                } else if (autoNavigate && backLeftMotor && backRightMotor) {
                 int centerIdx = (horizontalResolution / downsample) / 2;
                 int leftIdx = centerIdx - 20;   // 20 points left of center (~60 degrees)
                 int rightIdx = centerIdx + 20;  // 20 points right of center (~60 degrees)

@@ -125,12 +125,15 @@ function showView(viewName) {
 }
 
 function worldToRadarScreen(range, angle) {
+    // For radar view, the robot is always at center facing up
+    // Range is in meters, convert to pixels
     const forward = range * Math.cos(angle);
     const left = range * Math.sin(angle);
-
+    
+    // Radar view: Y is up (forward), X is right
     return {
         x: radarCenterX + left * radarScale,
-        y: radarCenterY - forward * radarScale,
+        y: radarCenterY - forward * radarScale,  // Negative because screen Y goes down
     };
 }
 
@@ -240,14 +243,14 @@ function renderRadarView() {
 function worldToMapScreen(worldX, worldY) {
     return {
         x: mapCanvas.width / 2 + (worldX - mapView.centerX) * mapView.zoom,
-        y: mapCanvas.height / 2 - (worldY - mapView.centerY) * mapView.zoom,
+        y: mapCanvas.height / 2 + (worldY - mapView.centerY) * mapView.zoom,
     };
 }
 
 function mapScreenToWorld(screenX, screenY) {
     return {
         x: mapView.centerX + (screenX - mapCanvas.width / 2) / mapView.zoom,
-        y: mapView.centerY - (screenY - mapCanvas.height / 2) / mapView.zoom,
+        y: mapView.centerY + (screenY - mapCanvas.height / 2) / mapView.zoom,
     };
 }
 
@@ -616,7 +619,7 @@ function setupMapInteractions() {
         const deltaY = event.clientY - mapView.dragStartY;
 
         mapView.centerX = mapView.dragOriginX - deltaX / mapView.zoom;
-        mapView.centerY = mapView.dragOriginY + deltaY / mapView.zoom;
+        mapView.centerY = mapView.dragOriginY - deltaY / mapView.zoom;
 
         if (activeView === 'map') {
             renderMapView();

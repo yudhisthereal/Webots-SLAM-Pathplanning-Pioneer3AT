@@ -44,6 +44,9 @@ SCAN_MATCH_THETA_STEP = math.radians(1)   # Reduced from 2 degrees
 SCAN_MATCH_MIN_IMPROVEMENT = 0.05  # Increased from 0.03 for theta corrections
 SCAN_MATCH_THETA_MIN_IMPROVEMENT = 0.10  # Minimum improvement threshold for accepting theta changes
 
+# Real vs Simulation adjustments
+FLIP_THETA_FOR_VISUALIZATION = True
+
 def wrap_angle(angle):
     """Wrap an angle to [-pi, pi]."""
     while angle > math.pi:
@@ -239,8 +242,10 @@ class OccupancyGrid:
     def refine_pose(self, robot_x, robot_y, robot_theta, ranges, angles):
         """Refine the supplied pose with a small local scan-matching search.
         
-        Prioritizes translation refinement over rotation refinement to prevent
-        theta drift from creating slanted walls in the occupancy grid.
+        CRITICAL: Only refines XY translation. Theta (rotation) comes directly from
+        wheel odometry, which is reliable for differential drive robots. Attempting
+        to refine theta creates circular corruption: wrong theta → corrupted map →
+        matches against corruption → reinforces wrong theta.
         """
         if not self.is_ready_for_scan_matching():
             return robot_x, robot_y, robot_theta, 0.0
@@ -251,11 +256,13 @@ class OccupancyGrid:
         # Level 1: Coarse translation search (NO theta adjustment)
         dx_values = np.arange(-SCAN_MATCH_TRANSLATION_RANGE, SCAN_MATCH_TRANSLATION_RANGE + 1e-6, SCAN_MATCH_TRANSLATION_STEP)
         dy_values = np.arange(-SCAN_MATCH_TRANSLATION_RANGE, SCAN_MATCH_TRANSLATION_RANGE + 1e-6, SCAN_MATCH_TRANSLATION_STEP)
+        # Theta is FIXED from wheel odometry - never adjusted
 
         for dx in dx_values:
             for dy in dy_values:
                 candidate_x = robot_x + float(dx)
                 candidate_y = robot_y + float(dy)
+                # Keep theta fixed from odometry
                 candidate_score = self.score_scan_pose(candidate_x, candidate_y, robot_theta, ranges, angles)
 
                 if candidate_score > best_score:
@@ -277,20 +284,6 @@ class OccupancyGrid:
                     if candidate_score > best_score:
                         best_score = candidate_score
                         best_pose = (candidate_x, candidate_y, robot_theta)
-
-        # Level 3: Small theta refinement (only if translation search improved things significantly)
-        translation_score = best_score
-        base_x, base_y, base_theta = best_pose
-        dtheta_values = np.arange(-SCAN_MATCH_THETA_RANGE, SCAN_MATCH_THETA_RANGE + 1e-6, SCAN_MATCH_THETA_STEP)
-
-        for dtheta in dtheta_values:
-            candidate_theta = wrap_angle(base_theta + float(dtheta))
-            candidate_score = self.score_scan_pose(base_x, base_y, candidate_theta, ranges, angles)
-
-            # Only accept theta if improvement is significant (to prevent theta drift)
-            if candidate_score > best_score + SCAN_MATCH_THETA_MIN_IMPROVEMENT:
-                best_score = candidate_score
-                best_pose = (base_x, base_y, candidate_theta)
 
         return best_pose[0], best_pose[1], best_pose[2], best_score
 
@@ -441,46 +434,38 @@ async def forward_udp_to_websocket():
                             slam_x = raw_robot_x
                             slam_y = raw_robot_y
                             slam_theta = raw_robot_theta
+                            last_raw_x = raw_robot_x
+                            last_raw_y = raw_robot_y
+                            last_raw_theta = raw_robot_theta
                             slam_initialized = True
                         else:
-                            predicted_x = raw_robot_x
-                            predicted_y = raw_robot_y
-                            predicted_theta = raw_robot_theta
-
+                            # Calculate odometry delta since last update
+                            delta_x = raw_robot_x - last_raw_x
+                            delta_y = raw_robot_y - last_raw_y
+                            delta_theta = raw_robot_theta - last_raw_theta
+                            
+                            # Apply delta to SLAM pose (this is the key!)
+                            predicted_x = slam_x + delta_x * math.cos(slam_theta) - delta_y * math.sin(slam_theta)
+                            predicted_y = slam_y + delta_x * math.sin(slam_theta) + delta_y * math.cos(slam_theta)
+                            predicted_theta = slam_theta + delta_theta
+                            
+                            # Now refine with scan matching
                             refined_x, refined_y, refined_theta, match_score = map_grid.refine_pose(
-                                predicted_x,
-                                predicted_y,
-                                predicted_theta,
-                                ranges,
-                                angles,
+                                predicted_x, predicted_y, predicted_theta, ranges, angles
                             )
-
+                            
+                            # Only accept if it improves the score
                             predicted_score = map_grid.score_scan_pose(predicted_x, predicted_y, predicted_theta, ranges, angles)
                             
-                            # Accept refinement only if improvement is significant
-                            if match_score >= predicted_score + SCAN_MATCH_MIN_IMPROVEMENT:
-                                # Check if theta changed significantly - be conservative
-                                theta_delta = abs(wrap_angle(refined_theta - predicted_theta))
-                                if theta_delta > math.radians(0.5):
-                                    # Only accept large theta changes if they're really beneficial
-                                    if match_score >= predicted_score + SCAN_MATCH_THETA_MIN_IMPROVEMENT:
-                                        slam_x = refined_x
-                                        slam_y = refined_y
-                                        slam_theta = refined_theta
-                                    else:
-                                        # Accept translation but keep theta from odometry
-                                        slam_x = refined_x
-                                        slam_y = refined_y
-                                        slam_theta = predicted_theta
-                                else:
-                                    # Small theta change, accept it
-                                    slam_x = refined_x
-                                    slam_y = refined_y
-                                    slam_theta = refined_theta
+                            if match_score > predicted_score + SCAN_MATCH_MIN_IMPROVEMENT:
+                                slam_x, slam_y, slam_theta = refined_x, refined_y, refined_theta
                             else:
-                                slam_x = predicted_x
-                                slam_y = predicted_y
-                                slam_theta = predicted_theta
+                                slam_x, slam_y, slam_theta = predicted_x, predicted_y, predicted_theta
+                            
+                            # Store for next iteration
+                            last_raw_x = raw_robot_x
+                            last_raw_y = raw_robot_y
+                            last_raw_theta = raw_robot_theta
                         
                         # Update occupancy grid
                         map_grid.update(slam_x, slam_y, slam_theta, ranges, angles)
@@ -497,10 +482,10 @@ async def forward_udp_to_websocket():
                             "angles": angles,
                             "robot_x": slam_x,
                             "robot_y": slam_y,
-                            "robot_theta": slam_theta,
+                            "robot_theta": -slam_theta if FLIP_THETA_FOR_VISUALIZATION else slam_theta,
                             "raw_robot_x": raw_robot_x,
                             "raw_robot_y": raw_robot_y,
-                            "raw_robot_theta": raw_robot_theta,
+                            "raw_robot_theta": -raw_robot_theta if FLIP_THETA_FOR_VISUALIZATION else raw_robot_theta,
                             "pose_source": "slam" if slam_initialized else "odometry",
                             "left_speed": scan_data.get('left_speed', 0),
                             "right_speed": scan_data.get('right_speed', 0),
@@ -525,6 +510,10 @@ async def forward_udp_to_websocket():
                                 
                         if scan_count % 30 == 0:
                             print(f"[SLAM] Processed {scan_count} scans, pose: x={slam_x:.2f}, y={slam_y:.2f}, theta={slam_theta:.2f}rad, score={output_message['slam_match_score']:.3f}")
+
+                        if scan_count % 50 == 0:
+                            print(f"[Orientation] Raw theta: {math.degrees(raw_robot_theta):.1f}° -> "
+                                f"Visualization theta: {math.degrees(-raw_robot_theta if FLIP_THETA_FOR_VISUALIZATION else raw_robot_theta):.1f}°")
                             
             except json.JSONDecodeError:
                 pass
