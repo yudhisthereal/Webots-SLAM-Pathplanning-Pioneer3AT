@@ -659,7 +659,7 @@ function drawMapCells(mapData) {
 
 function drawRobotOnMap() {
     const screen = worldToMapScreen(robotX, robotY);
-    const heading = robotTheta;
+    const heading = robotTheta + Math.PI; // invert, the one from simulation is inverted.
     const forwardX = Math.cos(heading);
     const forwardY = Math.sin(heading);
     const leftX = -Math.sin(heading);
