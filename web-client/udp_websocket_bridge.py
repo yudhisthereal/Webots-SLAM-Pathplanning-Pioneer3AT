@@ -27,7 +27,7 @@ BROADCAST_MAP_HZ = 1    # 1 Hz map updates
 
 # Planner settings
 COARSE_FACTOR = 8  # how many fine cells per coarse cell
-ROBOT_WIDTH = 0.35  # meters (used to inflate obstacles)
+ROBOT_WIDTH = 0.35  # meters
 
 # UDP port robot listens on for commands/path
 ROBOT_CMD_PORT = 8767
@@ -502,27 +502,6 @@ def coarse_grid_from_map(map_data, coarse_factor=COARSE_FACTOR):
         'data': coarse,
     }
 
-
-def inflate_coarse_grid(coarse, robot_width=ROBOT_WIDTH):
-    if coarse is None:
-        return None
-    grid = coarse['data'].copy()
-    cres = coarse['resolution']
-    inflate_cells = int(math.ceil((robot_width / 2.0) / cres))
-    h, w = grid.shape
-    out = grid.copy()
-    for y in range(h):
-        for x in range(w):
-            if grid[y, x] == 1:
-                y0 = max(0, y - inflate_cells)
-                y1 = min(h - 1, y + inflate_cells)
-                x0 = max(0, x - inflate_cells)
-                x1 = min(w - 1, x + inflate_cells)
-                out[y0:y1+1, x0:x1+1] = 1
-    coarse['data'] = out
-    return coarse
-
-
 def astar_plan(coarse, start_xy, goal_xy):
     """A* on coarse grid. Returns list of world points (x,y)."""
     if coarse is None:
@@ -656,29 +635,43 @@ class PlannerWorker:
     def __init__(self, slam_processor, shared_state):
         self.slam_processor = slam_processor
         self.shared_state = shared_state
-        self.goal = None
+        self._goal = None  # Private variable for goal
         self.path = []
         self.start_at_goal = None
         self.lock = threading.Lock()
-        self.request_queue: Deque = deque()
+        self.request_queue = deque()  # <-- Use deque() directly
 
-    def set_goal(self, x, y):
+    def get_goal(self):
+        """Get the current goal"""
         with self.lock:
+            return self._goal
+    
+    def set_goal(self, x, y):
+        """Set the goal by coordinates"""
+        with self.lock:
+            self._goal = (x, y)
             self.request_queue.append((x, y))
-
+    
     def get_path(self):
+        """Get the current path"""
         with self.lock:
             return list(self.path)
 
     def planner_loop(self, stop_event: threading.Event):
+        """Main planning loop"""
         print("[Planner] Thread started")
         while not stop_event.is_set():
-            if not self.request_queue:
+            # Check if we have a goal to process
+            goal = None
+            with self.lock:
+                if self.request_queue:
+                    goal = self.request_queue.popleft()
+            
+            if goal is None:
                 time.sleep(0.05)
                 continue
 
-            with self.lock:
-                gx, gy = self.request_queue.popleft()
+            # Get current robot pose
             slam_state = self.shared_state.get_latest()
             if slam_state is None:
                 continue
@@ -687,16 +680,16 @@ class PlannerWorker:
 
             self.start_at_goal = (sx, sy)
 
+            # Get map and plan path
             map_data = self.slam_processor.get_map()
-            coarse = coarse_grid_from_map(map_data)
-            coarse = inflate_coarse_grid(coarse, ROBOT_WIDTH)
-            planned = astar_plan(coarse, (sx, sy), (gx, gy))
+            coarse = coarse_grid_from_map(map_data)  # Just downsample, no inflation
+            planned = astar_plan(coarse, (sx, sy), goal)
 
             with self.lock:
-                self.goal = (gx, gy)
+                self._goal = goal  # Keep the goal
                 self.path = planned
 
-            print(f"[Planner] Planned path with {len(planned)} points to ({gx:.2f},{gy:.2f})")
+            print(f"[Planner] Planned path with {len(planned)} points to ({goal[0]:.2f},{goal[1]:.2f})")
             time.sleep(0.05)
 
 
@@ -713,7 +706,7 @@ def udp_receiver(shared_packet: AtomicSharedPacket, stop_event: threading.Event)
     
     while not stop_event.is_set():
         try:
-            data, addr = udp_socket.recvfrom(65535)
+            data, _ = udp_socket.recvfrom(65535)
             
             try:
                 message = data.decode('utf-8')
@@ -840,6 +833,23 @@ async def websocket_broadcaster(shared_state: AtomicSharedState, slam_processor:
             
             slam_state = shared_state.get_latest()
             
+            # Get the coarse grid for visualization
+            coarse_grid = None
+            if slam_processor and slam_processor.map_grid:
+                map_data = slam_processor.get_map()
+                if map_data:
+                    coarse = coarse_grid_from_map(map_data, COARSE_FACTOR)
+                    if coarse:
+                        coarse_grid = {
+                            'width': coarse['width'],
+                            'height': coarse['height'],
+                            'resolution': coarse['resolution'],
+                            'origin_x': coarse['origin_x'],
+                            'origin_y': coarse['origin_y'],
+                            'data': coarse['data'].flatten().tolist() if isinstance(coarse['data'], np.ndarray) else coarse['data']
+                        }
+
+            
             if slam_state and connected_clients:
                 if now - last_pose_broadcast >= pose_interval:
                     last_pose_broadcast = now                    
@@ -871,11 +881,16 @@ async def websocket_broadcaster(shared_state: AtomicSharedState, slam_processor:
                     
                     if now - last_map_broadcast >= map_interval:
                         output_message["map"] = slam_processor.get_map()
+                        if coarse_grid:
+                            output_message["coarse_grid"] = coarse_grid  # Downsampled grid for A*
                         last_map_broadcast = now
 
                     current_path = planner.get_path() if planner is not None else []
                     if current_path:
                         output_message['path'] = [{'x': p[0], 'y': p[1]} for p in current_path]
+                    
+                    if planner.get_goal():
+                        output_message["goal"] = {"x": planner.get_goal()[0], "y": planner.get_goal()[1]}
 
                     if current_path:
                         sig = tuple((round(p[0],3), round(p[1],3)) for p in current_path)

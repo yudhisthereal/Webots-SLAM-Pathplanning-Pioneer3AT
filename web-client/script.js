@@ -44,6 +44,7 @@ let slamMatchScore = 0;
 let currentPath = [];
 let manualDriving = false; // when true, keyboard controls are forwarded to robot
 let showGridMap = true; // toggle for grid map visibility
+let currentCoarseGrid = null;  // Downsampled grid for A* planning
 
 // Statistics
 let lastScanTime = 0;
@@ -291,6 +292,59 @@ function toggleGridMap() {
     if (activeView === 'map') {
         renderMapView();
     }
+    console.log('[DEBUG] Coarse grid visibility toggled to:', showGridMap);
+}
+
+function drawCoarseGrid(coarseGridData) {
+    if (!coarseGridData || !coarseGridData.data || !showGridMap) {
+        return;
+    }
+
+    const mapWidth = coarseGridData.width;
+    const mapHeight = coarseGridData.height;
+    const resolution = coarseGridData.resolution;
+    const originX = coarseGridData.origin_x || -mapWidth * resolution / 2;
+    const originY = coarseGridData.origin_y || -mapHeight * resolution / 2;
+    const cellSize = resolution * mapView.zoom;
+
+    // Skip if cells are too small for performance
+    const step = cellSize < 1.0 ? 2 : 1;
+    
+    const visibleWorldWidth = mapCanvas.width / mapView.zoom;
+    const visibleWorldHeight = mapCanvas.height / mapView.zoom;
+    const leftWorld = mapView.centerX - visibleWorldWidth / 2 - resolution * step;
+    const rightWorld = mapView.centerX + visibleWorldWidth / 2 + resolution * step;
+    const bottomWorld = mapView.centerY - visibleWorldHeight / 2 - resolution * step;
+    const topWorld = mapView.centerY + visibleWorldHeight / 2 + resolution * step;
+
+    const gxStart = Math.max(0, Math.floor((leftWorld - originX) / resolution));
+    const gxEnd = Math.min(mapWidth - 1, Math.ceil((rightWorld - originX) / resolution));
+    const gyStart = Math.max(0, Math.floor((bottomWorld - originY) / resolution));
+    const gyEnd = Math.min(mapHeight - 1, Math.ceil((topWorld - originY) / resolution));
+
+    for (let gy = gyStart; gy <= gyEnd; gy += step) {
+        for (let gx = gxStart; gx <= gxEnd; gx += step) {
+            const value = coarseGridData.data[gy * mapWidth + gx];
+            if (value !== 1) continue;  // Only draw occupied cells
+
+            const worldX = originX + gx * resolution;
+            const worldY = originY + gy * resolution;
+            const screen = worldToMapScreen(worldX, worldY);
+            const size = cellSize * step;
+
+            if (screen.x + size < 0 || screen.x > mapCanvas.width || 
+                screen.y + size < 0 || screen.y > mapCanvas.height) {
+                continue;
+            }
+
+            // Draw coarse grid cells with a distinctive transparent color
+            mapCtx.fillStyle = 'rgba(255, 200, 0, 0.3)';  // Yellow-orange with transparency
+            mapCtx.strokeStyle = 'rgba(255, 200, 0, 0.5)';
+            mapCtx.lineWidth = 0.5;
+            mapCtx.fillRect(screen.x, screen.y, size, size);
+            mapCtx.strokeRect(screen.x, screen.y, size, size);
+        }
+    }
 }
 
 function drawMapAxes() {
@@ -311,51 +365,58 @@ function drawMapAxes() {
     if (range / step < 4) step /= 2;
     if (range / step < 2) step /= 2;
     
-    // Draw the origin axes (bold lines at x=0, y=0 if visible)
-    mapCtx.strokeStyle = 'rgba(100, 100, 150, 0.3)';
-    mapCtx.lineWidth = 1;
+    // ============ DRAW AXIS LINES ============
+    mapCtx.strokeStyle = 'rgba(100, 100, 150, 0.4)';
+    mapCtx.lineWidth = 1.5;
     
-    // Check if origin is visible
+    // Check if origin is visible and draw axes
+    const originScreen = worldToMapScreen(0, 0);
+    const originVisible = (leftWorld <= 0 && rightWorld >= 0 && bottomWorld <= 0 && topWorld >= 0);
+    
+    // Draw Y-axis (vertical line at x=0)
     if (leftWorld <= 0 && rightWorld >= 0) {
-        const originScreen = worldToMapScreen(0, 0);
         mapCtx.beginPath();
         mapCtx.moveTo(originScreen.x, 0);
         mapCtx.lineTo(originScreen.x, canvasHeight);
         mapCtx.stroke();
         
-        // Label the Y-axis (at x=0)
+        // Label the Y-axis
         mapCtx.fillStyle = '#555';
-        mapCtx.font = '10px Arial';
-        mapCtx.fillText('Y', originScreen.x + 4, 14);
+        mapCtx.font = 'bold 12px Arial';
+        mapCtx.textAlign = 'left';
+        mapCtx.textBaseline = 'bottom';
+        mapCtx.fillText('Y', originScreen.x + 6, 18);
     }
     
+    // Draw X-axis (horizontal line at y=0)
     if (bottomWorld <= 0 && topWorld >= 0) {
-        const originScreen = worldToMapScreen(0, 0);
         mapCtx.beginPath();
         mapCtx.moveTo(0, originScreen.y);
         mapCtx.lineTo(canvasWidth, originScreen.y);
         mapCtx.stroke();
         
-        // Label the X-axis (at y=0)
+        // Label the X-axis
         mapCtx.fillStyle = '#555';
-        mapCtx.font = '10px Arial';
-        mapCtx.fillText('X', canvasWidth - 20, originScreen.y - 4);
+        mapCtx.font = 'bold 12px Arial';
+        mapCtx.textAlign = 'right';
+        mapCtx.textBaseline = 'bottom';
+        mapCtx.fillText('X', canvasWidth - 8, originScreen.y - 4);
     }
     
-    // Draw X-axis ticks and labels (along the bottom edge of the visible area)
+    // ============ X-AXIS TICKS AND LABELS (bottom edge) ============
     const yPosForXLabels = bottomWorld;
     const xStart = Math.ceil(leftWorld / step) * step;
     const xEnd = Math.floor(rightWorld / step) * step;
     
     mapCtx.fillStyle = '#666';
-    mapCtx.font = '9px Arial';
+    mapCtx.font = '10px Arial';
     mapCtx.textAlign = 'center';
     mapCtx.textBaseline = 'top';
     
     for (let x = xStart; x <= xEnd; x += step) {
-        if (Math.abs(x) < 0.001) continue; // Skip origin (already labeled)
+        if (Math.abs(x) < 0.001) continue; // Skip origin
         const screen = worldToMapScreen(x, yPosForXLabels);
-        if (screen.x >= 0 && screen.x <= canvasWidth) {
+        if (screen.x >= 0 && screen.x <= canvasWidth && screen.y >= 0 && screen.y <= canvasHeight) {
             // Tick mark
             mapCtx.strokeStyle = 'rgba(80, 80, 120, 0.3)';
             mapCtx.lineWidth = 1;
@@ -370,7 +431,7 @@ function drawMapAxes() {
         }
     }
     
-    // Draw Y-axis ticks and labels (along the left edge of the visible area)
+    // ============ Y-AXIS TICKS AND LABELS (left edge) ============
     const xPosForYLabels = leftWorld;
     const yStart = Math.ceil(bottomWorld / step) * step;
     const yEnd = Math.floor(topWorld / step) * step;
@@ -379,9 +440,9 @@ function drawMapAxes() {
     mapCtx.textBaseline = 'middle';
     
     for (let y = yStart; y <= yEnd; y += step) {
-        if (Math.abs(y) < 0.001) continue; // Skip origin (already labeled)
+        if (Math.abs(y) < 0.001) continue; // Skip origin
         const screen = worldToMapScreen(xPosForYLabels, y);
-        if (screen.y >= 0 && screen.y <= canvasHeight) {
+        if (screen.x >= 0 && screen.x <= canvasWidth && screen.y >= 0 && screen.y <= canvasHeight) {
             // Tick mark
             mapCtx.strokeStyle = 'rgba(80, 80, 120, 0.3)';
             mapCtx.lineWidth = 1;
@@ -396,16 +457,100 @@ function drawMapAxes() {
         }
     }
     
-    // Draw corner origin indicator
+    // ============ Y-AXIS TICKS AND LABELS (right edge) ============
+    // This is the missing part - show Y values on the right side too
+    const xPosForYLabelsRight = rightWorld;
+    
     mapCtx.textAlign = 'left';
+    mapCtx.textBaseline = 'middle';
+    
+    for (let y = yStart; y <= yEnd; y += step) {
+        if (Math.abs(y) < 0.001) continue; // Skip origin (already labeled on left)
+        const screen = worldToMapScreen(xPosForYLabelsRight, y);
+        if (screen.x >= 0 && screen.x <= canvasWidth && screen.y >= 0 && screen.y <= canvasHeight) {
+            // Tick mark
+            mapCtx.strokeStyle = 'rgba(80, 80, 120, 0.3)';
+            mapCtx.lineWidth = 1;
+            mapCtx.beginPath();
+            mapCtx.moveTo(screen.x + 4, screen.y);
+            mapCtx.lineTo(screen.x + 10, screen.y);
+            mapCtx.stroke();
+            
+            // Label
+            mapCtx.fillStyle = '#666';
+            mapCtx.fillText(y.toFixed(1), screen.x + 12, screen.y);
+        }
+    }
+    
+    // ============ X-AXIS TICKS AND LABELS (top edge) ============
+    // Also show X values on the top edge for completeness
+    const yPosForXLabelsTop = topWorld;
+    
+    mapCtx.textAlign = 'center';
     mapCtx.textBaseline = 'bottom';
-    mapCtx.fillStyle = '#888';
-    mapCtx.font = '11px Arial';
-    mapCtx.fillText('0', 6, canvasHeight - 2);
+    
+    for (let x = xStart; x <= xEnd; x += step) {
+        if (Math.abs(x) < 0.001) continue; // Skip origin
+        const screen = worldToMapScreen(x, yPosForXLabelsTop);
+        if (screen.x >= 0 && screen.x <= canvasWidth && screen.y >= 0 && screen.y <= canvasHeight) {
+            // Tick mark
+            mapCtx.strokeStyle = 'rgba(80, 80, 120, 0.3)';
+            mapCtx.lineWidth = 1;
+            mapCtx.beginPath();
+            mapCtx.moveTo(screen.x, screen.y - 4);
+            mapCtx.lineTo(screen.x, screen.y - 10);
+            mapCtx.stroke();
+            
+            // Label
+            mapCtx.fillStyle = '#666';
+            mapCtx.fillText(x.toFixed(1), screen.x, screen.y - 12);
+        }
+    }
+    
+    // ============ ORIGIN LABEL ============
+    if (originVisible) {
+        mapCtx.textAlign = 'left';
+        mapCtx.textBaseline = 'bottom';
+        mapCtx.fillStyle = '#888';
+        mapCtx.font = '10px Arial';
+        mapCtx.fillText('0', originScreen.x + 4, originScreen.y - 4);
+    }
+    
+    // ============ AXIS ARROWS ============
+    // Draw arrow heads on the positive axes if visible
+    mapCtx.fillStyle = 'rgba(100, 100, 150, 0.5)';
+    
+    // X-axis arrow (right side)
+    if (bottomWorld <= 0 && topWorld >= 0) {
+        const rightEdgeX = worldToMapScreen(rightWorld - 0.1, 0);
+        if (rightEdgeX.x < canvasWidth - 20) {
+            // Draw arrow head
+            mapCtx.beginPath();
+            mapCtx.moveTo(rightEdgeX.x + 10, rightEdgeX.y);
+            mapCtx.lineTo(rightEdgeX.x + 2, rightEdgeX.y - 5);
+            mapCtx.lineTo(rightEdgeX.x + 2, rightEdgeX.y + 5);
+            mapCtx.closePath();
+            mapCtx.fill();
+        }
+    }
+    
+    // Y-axis arrow (top side)
+    if (leftWorld <= 0 && rightWorld >= 0) {
+        const topEdgeY = worldToMapScreen(0, topWorld - 0.1);
+        if (topEdgeY.y > 20) {
+            // Draw arrow head
+            mapCtx.beginPath();
+            mapCtx.moveTo(topEdgeY.x, topEdgeY.y - 10);
+            mapCtx.lineTo(topEdgeY.x - 5, topEdgeY.y - 2);
+            mapCtx.lineTo(topEdgeY.x + 5, topEdgeY.y - 2);
+            mapCtx.closePath();
+            mapCtx.fill();
+        }
+    }
 }
 
 function drawMapCells(mapData) {
-    if (!mapData || !mapData.data || !showGridMap) {
+    if (!mapData || !mapData.data) {
         return;
     }
 
@@ -560,13 +705,16 @@ function renderMapView() {
     mapCtx.fillStyle = '#f4f7fb';
     mapCtx.fillRect(0, 0, mapCanvas.width, mapCanvas.height);
 
-    // Draw axes instead of grid
+    // Draw axes
     drawMapAxes();
 
     // Draw map cells (if enabled)
     if (currentMap) {
         drawMapCells(currentMap);
     }
+
+    // Draw the coarse grid (toggleable)
+    drawCoarseGrid(currentCoarseGrid);
 
     drawRobotOnMap();
 
@@ -661,12 +809,21 @@ function connectWebSocket() {
                 if (data.map) {
                     currentMap = data.map;
                 }
+                if (data.coarse_grid) {
+                    currentCoarseGrid = data.coarse_grid;
+                    console.log('[DEBUG] Received coarse grid:', currentCoarseGrid.width, 'x', currentCoarseGrid.height);
+                }
 
                 // Update path if present
                 if (data.path) {
                     currentPath = data.path.map(p => ({ x: p.x, y: p.y }));
                 } else {
                     currentPath = [];
+                }
+
+                if (data.goal) {
+                    currentGoal = { x: data.goal.x, y: data.goal.y };
+                    console.log('[Goal] Updated goal:', currentGoal);
                 }
 
                 renderActiveView();
@@ -871,9 +1028,18 @@ function setupMapInteractions() {
         const canvasX = (event.clientX - rect.left) * scaleX;
         const canvasY = (event.clientY - rect.top) * scaleY;
         const world = mapScreenToWorld(canvasX, canvasY);
+        
+        // Store goal locally
+        currentGoal = { x: world.x, y: world.y };
         console.log('[Map] Goal set at', world.x.toFixed(2), world.y.toFixed(2));
+        
         if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: 'set_goal', x: world.x, y: world.y }));
+        }
+        
+        // Immediately update the map to show the goal
+        if (activeView === 'map') {
+            renderMapView();
         }
     });
 }
@@ -917,26 +1083,192 @@ window.addEventListener('load', function() {
     });
 });
 
+// Add these variables at the top with other data storage
+let currentGoal = null;  // Store the current goal position
+
+// Update the drawPath function
 function drawPath(path) {
-    if (!path || path.length === 0) return;
+    // ============ DRAW GOAL POINT ============
+    if (currentGoal) {
+        const goalScreen = worldToMapScreen(currentGoal.x, currentGoal.y);
+        
+        // Draw a pulsing circle for the goal
+        const pulseRadius = 10 + 4 * Math.sin(Date.now() / 500);
+        
+        // Outer glow
+        const gradient = mapCtx.createRadialGradient(
+            goalScreen.x, goalScreen.y, 0,
+            goalScreen.x, goalScreen.y, 20
+        );
+        gradient.addColorStop(0, 'rgba(255, 0, 0, 0.6)');
+        gradient.addColorStop(0.5, 'rgba(255, 0, 0, 0.2)');
+        gradient.addColorStop(1, 'rgba(255, 0, 0, 0)');
+        mapCtx.fillStyle = gradient;
+        mapCtx.beginPath();
+        mapCtx.arc(goalScreen.x, goalScreen.y, 20, 0, 2 * Math.PI);
+        mapCtx.fill();
+        
+        // Goal point
+        mapCtx.fillStyle = '#ff0000';
+        mapCtx.beginPath();
+        mapCtx.arc(goalScreen.x, goalScreen.y, 6, 0, 2 * Math.PI);
+        mapCtx.fill();
+        
+        // Goal border
+        mapCtx.strokeStyle = '#ff4444';
+        mapCtx.lineWidth = 2;
+        mapCtx.beginPath();
+        mapCtx.arc(goalScreen.x, goalScreen.y, 8, 0, 2 * Math.PI);
+        mapCtx.stroke();
+        
+        // Goal label
+        mapCtx.fillStyle = '#ff0000';
+        mapCtx.font = 'bold 11px Arial';
+        mapCtx.textAlign = 'left';
+        mapCtx.textBaseline = 'bottom';
+        mapCtx.fillText('🎯 GOAL', goalScreen.x + 12, goalScreen.y - 4);
+        mapCtx.fillStyle = '#cc0000';
+        mapCtx.font = '9px Arial';
+        mapCtx.textAlign = 'left';
+        mapCtx.textBaseline = 'top';
+        mapCtx.fillText(`(${currentGoal.x.toFixed(2)}, ${currentGoal.y.toFixed(2)})`, goalScreen.x + 12, goalScreen.y + 4);
+    }
+    
+    // ============ DRAW PATH ============
+    if (!path || path.length === 0) {
+        return;
+    }
+    
+    // ============ DASHED LINE FROM ROBOT TO FIRST WAYPOINT ============
+    // Get robot position
+    const robotScreen = worldToMapScreen(robotX, robotY);
+    const firstPoint = path[0];
+    const firstScreen = worldToMapScreen(firstPoint.x, firstPoint.y);
+    
+    // Calculate distance from robot to first waypoint
+    const dx = firstPoint.x - robotX;
+    const dy = firstPoint.y - robotY;
+    const distance = Math.sqrt(dx*dx + dy*dy);
+    
+    // Draw dashed line if distance is significant (> 0.1m)
+    if (distance > 0.1) {
+        mapCtx.setLineDash([6, 6]);
+        mapCtx.strokeStyle = 'rgba(255, 136, 0, 0.4)';
+        mapCtx.lineWidth = 1.5;
+        mapCtx.beginPath();
+        mapCtx.moveTo(robotScreen.x, robotScreen.y);
+        mapCtx.lineTo(firstScreen.x, firstScreen.y);
+        mapCtx.stroke();
+        mapCtx.setLineDash([]); // Reset to solid line
+        
+        // Add a small "connection" label at midpoint
+        const midX = (robotScreen.x + firstScreen.x) / 2;
+        const midY = (robotScreen.y + firstScreen.y) / 2;
+        mapCtx.fillStyle = 'rgba(255, 136, 0, 0.6)';
+        mapCtx.font = '9px Arial';
+        mapCtx.textAlign = 'center';
+        mapCtx.textBaseline = 'bottom';
+        const distText = distance.toFixed(2) + 'm';
+        // Background for better readability
+        const metrics = mapCtx.measureText(distText);
+        const padding = 4;
+        mapCtx.fillStyle = 'rgba(244, 247, 251, 0.8)';
+        mapCtx.fillRect(
+            midX - metrics.width/2 - padding,
+            midY - 16 - padding,
+            metrics.width + padding*2,
+            16 + padding*2
+        );
+        mapCtx.fillStyle = 'rgba(255, 136, 0, 0.8)';
+        mapCtx.fillText(distText, midX, midY - 4);
+    }
+    
+    // ============ DRAW PATH WAYPOINTS ============
+    // Draw the path as a solid line with waypoints
     mapCtx.strokeStyle = '#ff8800';
-    mapCtx.lineWidth = 2;
+    mapCtx.lineWidth = 2.5;
+    mapCtx.setLineDash([]);
     mapCtx.beginPath();
+    
     for (let i = 0; i < path.length; i++) {
         const p = path[i];
         const s = worldToMapScreen(p.x, p.y);
-        if (i === 0) mapCtx.moveTo(s.x, s.y);
-        else mapCtx.lineTo(s.x, s.y);
+        if (i === 0) {
+            mapCtx.moveTo(s.x, s.y);
+        } else {
+            mapCtx.lineTo(s.x, s.y);
+        }
     }
     mapCtx.stroke();
-
-    // Draw points
+    
+    // Draw waypoint markers
     for (let i = 0; i < path.length; i++) {
         const p = path[i];
         const s = worldToMapScreen(p.x, p.y);
-        mapCtx.fillStyle = '#ff4400';
+        
+        // Different colors for first and last waypoints
+        let color, size;
+        if (i === 0) {
+            color = '#ff8800';
+            size = 5;
+        } else if (i === path.length - 1) {
+            color = '#ff4400';
+            size = 5;
+        } else {
+            color = '#ffaa44';
+            size = 3;
+        }
+        
+        // Outer glow for waypoints
+        mapCtx.fillStyle = 'rgba(255, 136, 0, 0.15)';
         mapCtx.beginPath();
-        mapCtx.arc(s.x, s.y, 4, 0, 2 * Math.PI);
+        mapCtx.arc(s.x, s.y, size + 6, 0, 2 * Math.PI);
         mapCtx.fill();
+        
+        // Waypoint point
+        mapCtx.fillStyle = color;
+        mapCtx.beginPath();
+        mapCtx.arc(s.x, s.y, size, 0, 2 * Math.PI);
+        mapCtx.fill();
+        
+        // Waypoint number (only if path is not too long)
+        if (path.length <= 20) {
+            mapCtx.fillStyle = 'rgba(0,0,0,0.6)';
+            mapCtx.font = '8px Arial';
+            mapCtx.textAlign = 'center';
+            mapCtx.textBaseline = 'bottom';
+            mapCtx.fillText((i + 1).toString(), s.x, s.y - size - 4);
+        }
+    }
+    
+    // ============ PATH DISTANCE LABEL ============
+    // Calculate total path length
+    let totalDistance = 0;
+    for (let i = 1; i < path.length; i++) {
+        const dx = path[i].x - path[i-1].x;
+        const dy = path[i].y - path[i-1].y;
+        totalDistance += Math.sqrt(dx*dx + dy*dy);
+    }
+    
+    if (path.length > 1 && totalDistance > 0.1) {
+        // Display total path length at the end of the path
+        const lastPoint = path[path.length - 1];
+        const lastScreen = worldToMapScreen(lastPoint.x, lastPoint.y);
+        
+        const label = '📏 ' + totalDistance.toFixed(2) + 'm';
+        mapCtx.fillStyle = 'rgba(244, 247, 251, 0.85)';
+        const metrics = mapCtx.measureText(label);
+        const padding = 6;
+        mapCtx.fillRect(
+            lastScreen.x - metrics.width/2 - padding,
+            lastScreen.y + 12 - padding,
+            metrics.width + padding*2,
+            20 + padding*2
+        );
+        mapCtx.fillStyle = '#cc6600';
+        mapCtx.font = '10px Arial';
+        mapCtx.textAlign = 'center';
+        mapCtx.textBaseline = 'top';
+        mapCtx.fillText(label, lastScreen.x, lastScreen.y + 14);
     }
 }
