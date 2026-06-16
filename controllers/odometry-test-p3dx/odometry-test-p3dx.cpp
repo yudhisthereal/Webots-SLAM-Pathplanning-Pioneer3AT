@@ -1,4 +1,4 @@
-// File: odometry-test-dx.cpp
+// File: odometry-test-p3dx.cpp
 // Description: Pioneer 3-DX Wheel Odometry - prints position and orientation
 // Uses 2 wheel encoders (differential drive with front caster)
 
@@ -68,9 +68,8 @@ public:
 class Odometry {
 private:
     // Pioneer 3-DX parameters (from WebOTS proto file)
-    // From the PROTO: wheel radius = 0.0975m, wheelbase = 0.33m (distance between left and right wheels)
-    double wheelRadius = 0.0975;        // meters (from Cylinder radius in BOUNDING_WHEEL)
-    double wheelBase = 0.33;            // meters (track width: left wheel at +0.165, right at -0.165)
+    double wheelRadius = 0.0975;        // meters
+    double wheelBase = 0.33;            // meters (track width)
     
     // Previous values for left and right wheels
     double prevLeftPos = 0;
@@ -133,11 +132,6 @@ public:
         cout << "X: " << x << " m, Y: " << y << " m, Θ: " << thetaDeg << "°" << endl;
     }
     
-    void printWheelOdometry(double leftPos, double rightPos) {
-        cout << "Left wheel: " << fixed << setprecision(3) << leftPos << " rad | ";
-        cout << "Right wheel: " << rightPos << " rad" << endl;
-    }
-    
     void reset() {
         x = y = theta = 0;
         linearVel = angularVel = 0;
@@ -153,14 +147,13 @@ public:
     double getAngularVel() { return angularVel; }
 };
 
-// Class to handle smooth velocity transitions using linear interpolation
 class VelocitySmoother {
 private:
     double targetLeftSpeed;
     double targetRightSpeed;
     double currentLeftSpeed;
     double currentRightSpeed;
-    double smoothingFactor;  // How fast to interpolate (0.1 to 0.3 works well)
+    double smoothingFactor;
     
 public:
     VelocitySmoother(double factor = 0.15) {
@@ -177,14 +170,12 @@ public:
     }
     
     void update(double dt) {
-        // Linear interpolation (lerp) for smooth transitions
-        // current = current + (target - current) * smoothingFactor
+        if (dt > 0.1) dt = 0.032; // Cap dt for stability
         currentLeftSpeed += (targetLeftSpeed - currentLeftSpeed) * smoothingFactor;
         currentRightSpeed += (targetRightSpeed - currentRightSpeed) * smoothingFactor;
         
-        // Optional: Add deadzone to prevent micro-movements when close to zero
-        if (fabs(currentLeftSpeed) < 0.01) currentLeftSpeed = 0.0;
-        if (fabs(currentRightSpeed) < 0.01) currentRightSpeed = 0.0;
+        if (fabs(currentLeftSpeed) < 0.005) currentLeftSpeed = 0.0;
+        if (fabs(currentRightSpeed) < 0.005) currentRightSpeed = 0.0;
     }
     
     double getLeftSpeed() { return currentLeftSpeed; }
@@ -203,7 +194,7 @@ public:
     }
     
     void setSmoothingFactor(double factor) {
-        smoothingFactor = max(0.05, min(0.5, factor)); // Clamp between 0.05 and 0.5
+        smoothingFactor = max(0.05, min(0.5, factor));
     }
 };
 
@@ -238,7 +229,6 @@ int main(int argc, char **argv) {
             close(cmd_sock);
             cmd_sock = -1;
         } else {
-            // set non-blocking
             int flags = fcntl(cmd_sock, F_GETFL, 0);
             fcntl(cmd_sock, F_SETFL, flags | O_NONBLOCK);
             cout << "[UDP] Command listener on port 8767" << endl;
@@ -254,7 +244,7 @@ int main(int argc, char **argv) {
     double verticalFov = 0.0;
     int numberOfLayers = 0;
     bool isMultiLayer = false;
-    bool *useLayer = nullptr;  // Array to track which layers to use (pointing down or level)
+    bool *useLayer = nullptr;
     
     if (lidar == NULL) {
         cout << "[WARNING] LiDAR 'lidar' not found!" << endl;
@@ -280,14 +270,12 @@ int main(int argc, char **argv) {
             cout << "[LiDAR] Vertical FOV: " << verticalFov * 180.0 / M_PI << " degrees" << endl;
             cout << "[LiDAR] This is a MULTI-LAYER (3D) LiDAR" << endl;
             
-            // Print layer angles and determine which to use
-            cout << "[LiDAR] Layer angles:" << endl;
             double verticalAngleStep = verticalFov / (numberOfLayers - 1);
             useLayer = new bool[numberOfLayers];
             
             for (int layer = 0; layer < numberOfLayers; layer++) {
                 double layerAngle = -verticalFov/2.0 + layer * verticalAngleStep;
-                useLayer[layer] = (layerAngle <= 0.0);  // Use layers pointing down or level
+                useLayer[layer] = (layerAngle <= 0.0);
                 
                 if (useLayer[layer]) {
                     cout << "  Layer " << layer << ": " << layerAngle * 180.0 / M_PI << "° (USING)" << endl;
@@ -298,32 +286,26 @@ int main(int argc, char **argv) {
         } else {
             isMultiLayer = false;
             cout << "[LiDAR] This is a SINGLE-LAYER (2D) LiDAR" << endl;
-            cout << "[LiDAR] Vertical beam divergence: " << verticalFov * 180.0 / M_PI << " degrees" << endl;
         }
     }
     
-    // Initialize motors (required for movement)
-    // Pioneer 3-DX has 2 drive wheels (left and right) + 1 passive caster
+    // Initialize motors
     Motor *leftMotor = robot->getMotor("left wheel");
     Motor *rightMotor = robot->getMotor("right wheel");
     
     if (leftMotor && rightMotor) {
-        // Set motors to velocity control mode (position = INFINITY for continuous rotation)
         leftMotor->setPosition(INFINITY);
         rightMotor->setPosition(INFINITY);
-        
         leftMotor->setVelocity(0.0);
         rightMotor->setVelocity(0.0);
-        
         cout << "[Motors] Left and right wheels ready" << endl;
     } else {
-        cout << "[ERROR] Motors not found! Check motor names in the PROTO" << endl;
-        cout << "Expected: 'left wheel' and 'right wheel'" << endl;
+        cout << "[ERROR] Motors not found!" << endl;
         delete robot;
         return -1;
     }
     
-    // Initialize encoders for both drive wheels
+    // Initialize encoders
     PositionSensor *leftEncoder = robot->getPositionSensor("left wheel sensor");
     PositionSensor *rightEncoder = robot->getPositionSensor("right wheel sensor");
     
@@ -332,11 +314,8 @@ int main(int argc, char **argv) {
         rightEncoder->enable(timeStep);
         cout << "[Encoders] Left and right wheel sensors enabled" << endl;
         cout << "[Params] Wheel radius: 0.0975m, Wheel base: 0.33m" << endl;
-        cout << "[Params] Wheel circumference: " << (2.0 * M_PI * 0.0975) << "m" << endl;
-        cout << "[Params] Max velocity: 12.3 rad/s (from PROTO)" << endl;
     } else {
-        cout << "[ERROR] Encoders not found! Check sensor names in the PROTO" << endl;
-        cout << "Expected: 'left wheel sensor' and 'right wheel sensor'" << endl;
+        cout << "[ERROR] Encoders not found!" << endl;
         delete robot;
         return -1;
     }
@@ -351,35 +330,36 @@ int main(int argc, char **argv) {
     cout << "  R          : Reset odometry" << endl;
     cout << "  P          : Print current pose" << endl;
     cout << "  L          : Print LiDAR data" << endl;
-    cout << "  + / -      : Increase/Decrease smoothing (current: 0.15)" << endl;
+    cout << "  + / -      : Increase/Decrease smoothing" << endl;
     cout << "========================================" << endl;
     
     Odometry odom;
-    VelocitySmoother smoother(0.15);  // Smoothing factor 0.15 for gradual transitions
+    VelocitySmoother smoother(0.15);
 
-    bool autoMode = false; // set by bridge
+    bool autoMode = false;
     std::vector<std::pair<double,double>> pathPoints;
     size_t pathIndex = 0;
+    bool pathActive = false;
     
-    // Control variables
     double targetLeftSpeed = 0.0;
     double targetRightSpeed = 0.0;
-    double maxSpeed = 6.0;      // Maximum wheel speed (rad/s) - below PROTO's 12.3 limit
+    double maxSpeed = 6.0;
     
     int iteration = 0;
-    int printInterval = 500 / timeStep;  // Print every ~500ms
-    int downsample = 3;  // Downsample LiDAR points for UDP
+    int printInterval = 500 / timeStep;
+    int downsample = 3;
     double lastTime = 0.0;
+    int lidarScanCounter = 0;
     
-    // LiDAR display variables
-    int lidarScanCounter = 0;  // Counter to skip initial unstable scans
+    // Command buffer
+    char cmdBuffer[65536];
     
     while (robot->step(timeStep) != -1) {
         double currentTime = robot->getTime();
         double dt = currentTime - lastTime;
         lastTime = currentTime;
         
-        // Read encoders (values in radians)
+        // Read encoders
         double leftPos = leftEncoder->getValue();
         double rightPos = rightEncoder->getValue();
         
@@ -407,65 +387,67 @@ int main(int argc, char **argv) {
                 case 'l':
                     if (lidar != NULL) {
                         cout << "[LiDAR] Scan at t=" << fixed << setprecision(2) << currentTime << "s" << endl;
-                        
                         if (isMultiLayer) {
-                            double verticalAngleStep = verticalFov / (numberOfLayers - 1);
                             for (int layer = 0; layer < numberOfLayers; layer++) {
                                 const float *layerImage = lidar->getLayerRangeImage(layer);
                                 if (layerImage != NULL) {
-                                    double layerAngle = -verticalFov/2.0 + layer * verticalAngleStep;
-                                    double layerAngleDeg = layerAngle * 180.0 / M_PI;
                                     float frontRange = layerImage[horizontalResolution/2];
-                                    cout << "  Layer " << layer << " (" << layerAngleDeg << "°): Front=" << frontRange << "m" << endl;
+                                    cout << "  Layer " << layer << ": Front=" << frontRange << "m" << endl;
                                 }
                             }
                         } else {
                             const float *rangeImage = lidar->getRangeImage();
                             if (rangeImage != NULL) {
                                 float frontRange = rangeImage[horizontalResolution/2];
-                                float leftRange = rangeImage[horizontalResolution/4];
-                                float rightRange = rangeImage[3*horizontalResolution/4];
-                                cout << "  Front: " << frontRange << "m, Left: " << leftRange << "m, Right: " << rightRange << "m" << endl;
+                                cout << "  Front: " << frontRange << "m" << endl;
                             }
                         }
-                    } else {
-                        cout << "[LiDAR] No data available" << endl;
                     }
                     break;
                     
                 case ' ':
-                    targetLeftSpeed = 0.0;
-                    targetRightSpeed = 0.0;
-                    smoother.setTarget(targetLeftSpeed, targetRightSpeed);
-                    cout << "[Stop] Smooth stopping initiated at t=" << fixed << setprecision(2) << currentTime << "s" << endl;
+                    if (!autoMode) {
+                        targetLeftSpeed = 0.0;
+                        targetRightSpeed = 0.0;
+                        smoother.setTarget(targetLeftSpeed, targetRightSpeed);
+                        cout << "[Stop] Smooth stopping" << endl;
+                    }
                     break;
                     
                 case Keyboard::UP:
-                    targetLeftSpeed = -maxSpeed;
-                    targetRightSpeed = -maxSpeed;
-                    smoother.setTarget(targetLeftSpeed, targetRightSpeed);
-                    cout << "[Forward] Smooth acceleration to " << maxSpeed << " rad/s" << endl;
+                    if (!autoMode) {
+                        targetLeftSpeed = -maxSpeed;
+                        targetRightSpeed = -maxSpeed;
+                        smoother.setTarget(targetLeftSpeed, targetRightSpeed);
+                        cout << "[Forward] Speed: " << maxSpeed << " rad/s" << endl;
+                    }
                     break;
                     
                 case Keyboard::DOWN:
-                    targetLeftSpeed = maxSpeed;
-                    targetRightSpeed = maxSpeed;
-                    smoother.setTarget(targetLeftSpeed, targetRightSpeed);
-                    cout << "[Backward] Smooth acceleration to " << maxSpeed << " rad/s" << endl;
+                    if (!autoMode) {
+                        targetLeftSpeed = maxSpeed;
+                        targetRightSpeed = maxSpeed;
+                        smoother.setTarget(targetLeftSpeed, targetRightSpeed);
+                        cout << "[Backward] Speed: " << maxSpeed << " rad/s" << endl;
+                    }
                     break;
                     
                 case Keyboard::LEFT:
-                    targetLeftSpeed = -maxSpeed;
-                    targetRightSpeed = maxSpeed;
-                    smoother.setTarget(targetLeftSpeed, targetRightSpeed);
-                    cout << "[Turn Left] Smooth rotation start" << endl;
+                    if (!autoMode) {
+                        targetLeftSpeed = -maxSpeed;
+                        targetRightSpeed = maxSpeed;
+                        smoother.setTarget(targetLeftSpeed, targetRightSpeed);
+                        cout << "[Turn Left]" << endl;
+                    }
                     break;
                     
                 case Keyboard::RIGHT:
-                    targetLeftSpeed = maxSpeed;
-                    targetRightSpeed = -maxSpeed;
-                    smoother.setTarget(targetLeftSpeed, targetRightSpeed);
-                    cout << "[Turn Right] Smooth rotation start" << endl;
+                    if (!autoMode) {
+                        targetLeftSpeed = maxSpeed;
+                        targetRightSpeed = -maxSpeed;
+                        smoother.setTarget(targetLeftSpeed, targetRightSpeed);
+                        cout << "[Turn Right]" << endl;
+                    }
                     break;
                     
                 case '+':
@@ -490,81 +472,185 @@ int main(int argc, char **argv) {
         }
         
         // Update smooth velocity transition
-        if (dt > 0 && dt < 0.1) {  // Only update with reasonable dt
+        if (dt > 0 && dt < 0.1) {
             smoother.update(dt);
         } else {
-            smoother.update(0.032);  // Use default timestep if dt is invalid
+            smoother.update(0.032);
         }
-
-        // Poll for incoming command messages from bridge (non-blocking)
+        
+        // Poll for incoming command messages from bridge
         if (cmd_sock >= 0) {
-            char buf[65536];
             struct sockaddr_in src;
             socklen_t srclen = sizeof(src);
-            ssize_t r = recvfrom(cmd_sock, buf, sizeof(buf)-1, 0, (struct sockaddr*)&src, &srclen);
+            ssize_t r = recvfrom(cmd_sock, cmdBuffer, sizeof(cmdBuffer)-1, 0, (struct sockaddr*)&src, &srclen);
             if (r > 0) {
-                buf[r] = '\0';
-                std::string msg(buf);
-                // Simple protocol: CMD:forward|backward|left|right|stop
-                // AUTO:1 or AUTO:0
-                // PATH:x1,y1;x2,y2;...
+                cmdBuffer[r] = '\0';
+                std::string msg(cmdBuffer);
+                
+                // Remove trailing newline
+                while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r')) {
+                    msg.pop_back();
+                }
+                
+                cout << "[DEBUG] Raw command received: '" << msg << "'" << endl;
+                cout << "[DEBUG] autoMode: " << (autoMode ? "true" : "false") << endl;
+                
                 if (msg.rfind("CMD:", 0) == 0) {
                     std::string cmd = msg.substr(4);
-                    // Only accept manual commands when not in auto mode
+                    cout << "[DEBUG] Parsed CMD: '" << cmd << "'" << endl;
+                    
                     if (!autoMode) {
+                        cout << "[Command] Executing: " << cmd << endl;
                         if (cmd == "forward") {
                             targetLeftSpeed = -maxSpeed;
                             targetRightSpeed = -maxSpeed;
                             smoother.setTarget(targetLeftSpeed, targetRightSpeed);
+                            cout << "[DEBUG] Set speeds to forward: " << targetLeftSpeed << ", " << targetRightSpeed << endl;
                         } else if (cmd == "backward") {
                             targetLeftSpeed = maxSpeed;
                             targetRightSpeed = maxSpeed;
                             smoother.setTarget(targetLeftSpeed, targetRightSpeed);
+                            cout << "[DEBUG] Set speeds to backward: " << targetLeftSpeed << ", " << targetRightSpeed << endl;
                         } else if (cmd == "left") {
                             targetLeftSpeed = -maxSpeed;
                             targetRightSpeed = maxSpeed;
                             smoother.setTarget(targetLeftSpeed, targetRightSpeed);
+                            cout << "[DEBUG] Set speeds to left: " << targetLeftSpeed << ", " << targetRightSpeed << endl;
                         } else if (cmd == "right") {
                             targetLeftSpeed = maxSpeed;
                             targetRightSpeed = -maxSpeed;
                             smoother.setTarget(targetLeftSpeed, targetRightSpeed);
+                            cout << "[DEBUG] Set speeds to right: " << targetLeftSpeed << ", " << targetRightSpeed << endl;
                         } else if (cmd == "stop") {
+                            targetLeftSpeed = 0.0;
+                            targetRightSpeed = 0.0;
+                            smoother.setTarget(0.0, 0.0);
+                            cout << "[DEBUG] Set speeds to stop" << endl;
+                        } else if (cmd == "auto") {
+                            // Toggle auto mode via command
+                            autoMode = !autoMode;
+                            cout << "[DEBUG] Toggled auto mode to: " << (autoMode ? "true" : "false") << endl;
+                            if (autoMode) {
+                                cout << "[Auto] Autonomous mode ENABLED" << endl;
+                                pathIndex = 0;
+                                pathActive = !pathPoints.empty();
+                            } else {
+                                cout << "[Auto] Autonomous mode DISABLED" << endl;
+                                pathPoints.clear();
+                                pathActive = false;
+                                targetLeftSpeed = 0.0;
+                                targetRightSpeed = 0.0;
+                                smoother.setTarget(0.0, 0.0);
+                            }
+                        } else {
+                            cout << "[DEBUG] Unknown command: " << cmd << endl;
+                        }
+                    } else {
+                        cout << "[DEBUG] Command ignored - autoMode is enabled" << endl;
+                    }
+                } else if (msg.rfind("AUTO:", 0) == 0) {
+                    std::string v = msg.substr(5);
+                    bool newAuto = (v == "1");
+                    cout << "[DEBUG] AUTO: setting autoMode to " << (newAuto ? "true" : "false") << endl;
+                    if (newAuto != autoMode) {
+                        autoMode = newAuto;
+                        if (autoMode) {
+                            cout << "[Auto] Autonomous mode ENABLED by bridge" << endl;
+                            pathIndex = 0;
+                            pathActive = !pathPoints.empty();
+                        } else {
+                            cout << "[Auto] Autonomous mode DISABLED by bridge" << endl;
+                            pathPoints.clear();
+                            pathActive = false;
                             targetLeftSpeed = 0.0;
                             targetRightSpeed = 0.0;
                             smoother.setTarget(0.0, 0.0);
                         }
                     }
-                } else if (msg.rfind("AUTO:", 0) == 0) {
-                    std::string v = msg.substr(5);
-                    autoMode = (v == "1");
-                    if (autoMode) {
-                        cout << "[Auto] Autonomous mode enabled" << endl;
-                        // stop manual movement target adjustments
-                        targetLeftSpeed = 0.0; targetRightSpeed = 0.0;
-                        smoother.setTarget(0.0, 0.0);
-                    } else {
-                        cout << "[Auto] Autonomous mode disabled" << endl;
-                        // clear path
-                        pathPoints.clear(); pathIndex = 0;
-                    }
                 } else if (msg.rfind("PATH:", 0) == 0) {
                     std::string body = msg.substr(5);
+                    cout << "[DEBUG] PATH received, length: " << body.length() << endl;
                     pathPoints.clear();
                     pathIndex = 0;
+                    pathActive = false;
+                    
                     std::stringstream ss(body);
                     std::string pair;
                     while (std::getline(ss, pair, ';')) {
-                        double px=0, py=0;
-                        if (sscanf(pair.c_str(), "%lf,%lf", &px, &py) == 2) {
-                            pathPoints.emplace_back(px, py);
+                        size_t comma = pair.find(',');
+                        if (comma != std::string::npos) {
+                            try {
+                                double px = std::stod(pair.substr(0, comma));
+                                double py = std::stod(pair.substr(comma + 1));
+                                pathPoints.emplace_back(px, py);
+                                cout << "[DEBUG] Added path point: " << px << ", " << py << endl;
+                            } catch (...) {
+                                cout << "[DEBUG] Failed to parse path point: " << pair << endl;
+                            }
                         }
                     }
-                    cout << "[Path] Received " << pathPoints.size() << " points" << endl;
+                    
+                    if (!pathPoints.empty()) {
+                        pathActive = true;
+                        cout << "[Path] Received " << pathPoints.size() << " points" << endl;
+                        cout << "[Path] First: (" << pathPoints[0].first << ", " << pathPoints[0].second << ")" << endl;
+                        if (pathPoints.size() > 1) {
+                            cout << "[Path] Last: (" << pathPoints.back().first << ", " << pathPoints.back().second << ")" << endl;
+                        }
+                    } else {
+                        cout << "[Path] Received empty path" << endl;
+                    }
+                } else {
+                    cout << "[DEBUG] Unknown message type: " << msg.substr(0, msg.find(':')) << endl;
                 }
+            }
+        }        
+        // Autonomous path following
+        if (autoMode && pathActive && !pathPoints.empty() && pathIndex < pathPoints.size()) {
+            double tx = pathPoints[pathIndex].first;
+            double ty = pathPoints[pathIndex].second;
+            double dxp = tx - odom.getX();
+            double dyp = ty - odom.getY();
+            double dist = sqrt(dxp*dxp + dyp*dyp);
+            double desired_heading = atan2(dyp, dxp);
+            double diff = desired_heading - odom.getTheta();
+            while (diff > M_PI) diff -= 2*M_PI;
+            while (diff < -M_PI) diff += 2*M_PI;
+
+            double turnThresh = 0.15;
+            double reachThresh = 0.12;  // Slightly smaller for better accuracy
+            double turnSpeed = maxSpeed * 0.7;
+
+            if (dist < reachThresh) {
+                pathIndex++;
+                cout << "[Path] Reached waypoint " << pathIndex << "/" << pathPoints.size() << endl;
+                if (pathIndex >= pathPoints.size()) {
+                    cout << "[Path] All waypoints reached! Stopping." << endl;
+                    pathActive = false;
+                    targetLeftSpeed = 0.0;
+                    targetRightSpeed = 0.0;
+                    smoother.setTarget(0.0, 0.0);
+                }
+            } else if (fabs(diff) > turnThresh) {
+                // Rotate in place
+                if (diff > 0) {
+                    targetLeftSpeed = -turnSpeed;
+                    targetRightSpeed = turnSpeed;
+                } else {
+                    targetLeftSpeed = turnSpeed;
+                    targetRightSpeed = -turnSpeed;
+                }
+                smoother.setTarget(targetLeftSpeed, targetRightSpeed);
+            } else {
+                // Move forward
+                double speed = maxSpeed * 0.9;
+                targetLeftSpeed = -speed;
+                targetRightSpeed = -speed;
+                smoother.setTarget(targetLeftSpeed, targetRightSpeed);
             }
         }
         
-        // Apply smooth motor commands
+        // Apply motor commands
         leftMotor->setVelocity(smoother.getLeftSpeed());
         rightMotor->setVelocity(smoother.getRightSpeed());
         
@@ -572,16 +658,13 @@ int main(int argc, char **argv) {
         if (lidar != NULL) {
             lidarScanCounter++;
             
-            // Skip first 10 scans as they may be inaccurate
             if (lidarScanCounter > 10) {
                 vector<float> allRanges;
                 vector<double> allAngles;
                 
                 if (isMultiLayer) {
                     for (int layer = 0; layer < numberOfLayers; layer++) {
-                        if (!useLayer[layer]) {
-                            continue;  // Skip layers that point upward
-                        }
+                        if (!useLayer[layer]) continue;
                         
                         const float *layerImage = lidar->getLayerRangeImage(layer);
                         if (layerImage != NULL) {
@@ -596,7 +679,6 @@ int main(int argc, char **argv) {
                         }
                     }
                 } else {
-                    // Single-layer (2D) LiDAR: use full range image directly
                     const float *rangeImage = lidar->getRangeImage();
                     if (rangeImage != NULL) {
                         for (int i = 0; i < horizontalResolution; i += downsample) {
@@ -610,16 +692,13 @@ int main(int argc, char **argv) {
                     }
                 }
                 
-                // Only send if we have data
                 if (!allRanges.empty()) {
-                    // Get odometry data
                     double robotX = odom.getX();
                     double robotY = odom.getY();
                     double robotTheta = odom.getTheta();
                     double linearVel = odom.getLinearVel();
                     double angularVel = odom.getAngularVel();
                     
-                    // Build JSON message with filtered LiDAR data and odometry
                     stringstream json;
                     json << fixed << setprecision(3);
                     json << "{\"type\":\"lidar_scan\",";
@@ -635,9 +714,8 @@ int main(int argc, char **argv) {
                     json << "\"right_speed\":" << smoother.getRightSpeed() << ",";
                     json << "\"linear_vel\":" << linearVel << ",";
                     json << "\"angular_vel\":" << angularVel << ",";
-                    json << "\"auto_navigate\":false,";
+                    json << "\"auto_navigate\":" << (autoMode ? "true" : "false") << ",";
                     
-                    // Add ranges
                     json << "\"ranges\":[";
                     for (size_t i = 0; i < allRanges.size(); i++) {
                         json << allRanges[i];
@@ -645,7 +723,6 @@ int main(int argc, char **argv) {
                     }
                     json << "],";
                     
-                    // Add angles
                     json << "\"angles\":[";
                     for (size_t i = 0; i < allAngles.size(); i++) {
                         json << allAngles[i];
@@ -653,55 +730,12 @@ int main(int argc, char **argv) {
                     }
                     json << "]}";
                     
-                    // Send UDP packet
                     udp.send(json.str());
                 }
             }
         }
-
-        // Autonomous path following (simple behavioral controller)
-        if (autoMode && !pathPoints.empty()) {
-            double tx = pathPoints[pathIndex].first;
-            double ty = pathPoints[pathIndex].second;
-            double dxp = tx - odom.getX();
-            double dyp = ty - odom.getY();
-            double dist = sqrt(dxp*dxp + dyp*dyp);
-            double desired_heading = atan2(dyp, dxp);
-            double diff = desired_heading - odom.getTheta();
-            while (diff > M_PI) diff -= 2*M_PI;
-            while (diff < -M_PI) diff += 2*M_PI;
-
-            double turnThresh = 0.15; // radians
-            double reachThresh = 0.14; // meters
-            double turnSpeed = maxSpeed * 0.8;
-
-            if (dist < reachThresh) {
-                // reached waypoint
-                pathIndex++;
-                if (pathIndex >= pathPoints.size()) {
-                    // finish
-                    pathPoints.clear(); pathIndex = 0;
-                    smoother.setTarget(0.0, 0.0);
-                }
-            } else if (fabs(diff) > turnThresh) {
-                // rotate in place towards waypoint
-                if (diff > 0) {
-                    targetLeftSpeed = -turnSpeed;
-                    targetRightSpeed = turnSpeed;
-                } else {
-                    targetLeftSpeed = turnSpeed;
-                    targetRightSpeed = -turnSpeed;
-                }
-                smoother.setTarget(targetLeftSpeed, targetRightSpeed);
-            } else {
-                // move forward towards waypoint
-                targetLeftSpeed = -maxSpeed * 0.9;
-                targetRightSpeed = -maxSpeed * 0.9;
-                smoother.setTarget(targetLeftSpeed, targetRightSpeed);
-            }
-        }
         
-        // Send robot info every 2 seconds (exactly like P3-AT)
+        // Send robot info every 2 seconds
         if (iteration % (int)(2000 / timeStep) == 0 && iteration > 0) {
             double robotX = odom.getX();
             double robotY = odom.getY();
@@ -719,10 +753,11 @@ int main(int argc, char **argv) {
             info << "\"y\":" << robotY << ",";
             info << "\"theta\":" << robotTheta << ",";
             info << "\"linear_vel\":" << linearVel << ",";
-            info << "\"angular_vel\":" << angularVel << "}";
+            info << "\"angular_vel\":" << angularVel << ",";
+            info << "\"auto_navigate\":" << (autoMode ? "true" : "false") << "}";
             udp.send(info.str());
             
-            cout << "[Robot] t=" << currentTime << "s, pos=(" << robotX << "," << robotY << "," << robotTheta << "), vel=" << linearVel << "m/s" << endl;
+            cout << "[Robot] t=" << currentTime << "s, pos=(" << robotX << "," << robotY << "," << robotTheta << "), auto=" << autoMode << endl;
         }
         
         // Print pose at regular intervals
@@ -730,15 +765,6 @@ int main(int argc, char **argv) {
             if (smoother.isMoving()) {
                 cout << "t=" << fixed << setprecision(2) << currentTime << "s | ";
                 odom.printPose();
-                // Show current speeds when moving (debug info)
-                cout << "    [vL: " << setw(6) << smoother.getLeftSpeed() 
-                     << ", vR: " << setw(6) << smoother.getRightSpeed() << " rad/s]" << endl;
-            } else {
-                // Print occasional pose even when stopped
-                if (iteration % (printInterval * 5) == 0) {
-                    cout << "t=" << fixed << setprecision(2) << currentTime << "s [idle] | ";
-                    odom.printPose();
-                }
             }
         }
         
@@ -750,5 +776,6 @@ int main(int argc, char **argv) {
     if (useLayer != nullptr) {
         delete[] useLayer;
     }
+    if (cmd_sock >= 0) close(cmd_sock);
     return 0;
 }

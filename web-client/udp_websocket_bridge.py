@@ -57,7 +57,7 @@ SCAN_MATCH_TRANSLATION_STEP = 0.05
 SCAN_MATCH_MIN_IMPROVEMENT = 0.05
 
 # Angular velocity threshold for scan matching and map updates (rad/s)
-ANGULAR_VEL_THRESHOLD = 0.2  # Skip scan matching and map updates if angular velocity exceeds this
+ANGULAR_VEL_THRESHOLD = 0.2
 
 # Coordinate system fix
 FLIP_THETA_FOR_VISUALIZATION = True
@@ -95,7 +95,6 @@ class SlamState:
     theta: float
     match_score: float
     packet_id_processed: int
-    # Store the latest ranges/angles for the web client
     ranges: Tuple[float, ...] = field(default_factory=tuple)
     angles: Tuple[float, ...] = field(default_factory=tuple)
     raw_robot_x: float = 0
@@ -106,7 +105,7 @@ class SlamState:
     auto_navigate: bool = True
     linear_vel: float = 0
     angular_vel: float = 0
-    scan_matching_skipped: bool = False  # Flag to indicate if scan matching was skipped
+    scan_matching_skipped: bool = False
 
 
 def wrap_angle(angle):
@@ -272,7 +271,6 @@ class OccupancyGrid:
 
     def update(self, robot_x, robot_y, robot_theta, ranges, angles, packet_id):
         """Update occupancy grid with new LiDAR scan"""
-        # Skip if we've already processed this packet
         if packet_id <= self.last_update_packet_id:
             return False
         
@@ -285,15 +283,12 @@ class OccupancyGrid:
             if r < MIN_RANGE or r > MAX_RANGE:
                 continue
 
-            # Endpoint in world frame
             end_x = robot_x + r * math.cos(robot_theta + angle)
             end_y = robot_y + r * math.sin(robot_theta + angle)
 
-            # Mark endpoint as occupied
             gx, gy = self.world_to_grid(end_x, end_y)
             self.mark_occupied_with_neighbors(gx, gy)
 
-            # Ray casting for free space
             steps = int(r / self.resolution)
             for step in range(steps):
                 t = step * self.resolution / r
@@ -305,7 +300,6 @@ class OccupancyGrid:
                     self.log_odds[gy, gx] += LOG_ODDS_FREE
                     self.log_odds[gy, gx] = np.clip(self.log_odds[gy, gx], MIN_LOG_ODDS, MAX_LOG_ODDS)
 
-        # Convert to occupancy for visualization
         prob = 1.0 / (1.0 + np.exp(-self.log_odds))
         self.occupancy = np.where(
             self.log_odds == 0, -1,
@@ -333,13 +327,11 @@ class AtomicSharedPacket:
         self._lock = threading.Lock()
     
     def update(self, packet: SimulationPacket):
-        """Update to a new packet (increment generation)"""
         with self._lock:
             self._packet = packet
             self._generation += 1
     
     def get_latest(self):
-        """Get the latest packet and its generation"""
         with self._lock:
             if self._packet is None:
                 return None, 0
@@ -355,12 +347,10 @@ class AtomicSharedState:
         self._lock = threading.Lock()
     
     def update(self, state: SlamState):
-        """Update to a new state"""
         with self._lock:
             self._state = state
     
     def get_latest(self):
-        """Get the latest state"""
         with self._lock:
             return self._state
 
@@ -373,19 +363,16 @@ class SlamProcessor:
         self.shared_state = shared_state
         self.map_grid = OccupancyGrid(MAP_SIZE, MAP_SIZE, MAP_RESOLUTION)
         
-        # Track last processed generation
         self.last_generation = 0
         
-        # Running pose
         self.slam_x = 0.0
         self.slam_y = 0.0
         self.slam_theta = 0.0
         self.slam_initialized = False
         
-        # Statistics
         self.processed_count = 0
         self.state_id = 0
-        self.skipped_count = 0  # Count of skipped updates due to high angular velocity
+        self.skipped_count = 0
     
     def process_loop(self, stop_event: threading.Event):
         """Main processing loop - runs in its own thread"""
@@ -394,19 +381,15 @@ class SlamProcessor:
         last_debug = time.time()
         
         while not stop_event.is_set():
-            # Get latest packet and generation
             packet, generation = self.shared_packet.get_latest()
             
-            # If no new packet, sleep briefly to avoid spinning
             if packet is None or generation == self.last_generation:
                 time.sleep(0.0001)
                 continue
             
-            # New packet available - process immediately
             self.last_generation = generation
             self.process_packet(packet)
             
-            # Debug output every 2 seconds
             if time.time() - last_debug > 2.0 and self.processed_count > 0:
                 last_debug = time.time()
                 print(f"[SLAM] Processed {self.processed_count} scans, {self.skipped_count} skipped, "
@@ -417,34 +400,29 @@ class SlamProcessor:
         """Process a single packet and update SLAM state"""
         self.processed_count += 1
         
-        # Check angular velocity - skip scan matching and map update if rotating too fast
         angular_vel_abs = abs(packet.angular_vel)
         is_rotating_fast = angular_vel_abs > ANGULAR_VEL_THRESHOLD
         
         if is_rotating_fast:
             self.skipped_count += 1
-            if self.skipped_count % 100 == 0:  # Log every 100 skipped updates
-                print(f"[SLAM] Skipping scan matching and map update (angular_vel={angular_vel_abs:.3f} rad/s > {ANGULAR_VEL_THRESHOLD} rad/s)")
+            if self.skipped_count % 100 == 0:
+                print(f"[SLAM] Skipping scan matching (angular_vel={angular_vel_abs:.3f} rad/s)")
         
-        # Start with raw odometry
         current_x = packet.robot_x
         current_y = -packet.robot_y if FLIP_ROBOT_Y_FROM_SIM else packet.robot_y
         current_theta = packet.robot_theta
         match_score = 0.0
         
-        # Apply scan matching ONLY if not rotating too fast AND map is ready
         if not is_rotating_fast and ENABLE_SCAN_MATCHING and self.map_grid.is_ready_for_scan_matching():
             refined_x, refined_y, refined_theta, match_score = self.map_grid.refine_pose(
                 current_x, current_y, current_theta, packet.ranges, packet.angles
             )
             
-            # Gentle correction
             current_x = (1 - CORRECTION_WEIGHT) * current_x + CORRECTION_WEIGHT * refined_x
             current_y = (1 - CORRECTION_WEIGHT) * current_y + CORRECTION_WEIGHT * refined_y
             theta_diff = wrap_angle(refined_theta - current_theta)
             current_theta = wrap_angle(current_theta + CORRECTION_WEIGHT * 0.5 * theta_diff)
         
-        # Initialize on first packet
         if not self.slam_initialized:
             self.slam_x = current_x
             self.slam_y = current_y
@@ -455,13 +433,11 @@ class SlamProcessor:
             self.slam_y = current_y
             self.slam_theta = current_theta
         
-        # Update occupancy grid ONLY if not rotating too fast
         map_updated = False
         if not is_rotating_fast:
             map_updated = self.map_grid.update(self.slam_x, self.slam_y, self.slam_theta, 
                                                packet.ranges, packet.angles, packet.packet_id)
         
-        # Create new immutable SlamState with all data needed for client
         self.state_id += 1
         new_state = SlamState(
             state_id=self.state_id,
@@ -484,7 +460,6 @@ class SlamProcessor:
             scan_matching_skipped=is_rotating_fast
         )
         
-        # Update shared state for broadcaster
         self.shared_state.update(new_state)
     
     def get_map(self):
@@ -493,7 +468,7 @@ class SlamProcessor:
 
 
 def coarse_grid_from_map(map_data, coarse_factor=COARSE_FACTOR):
-    """Create a downsampled occupancy grid. If any fine cell inside a coarse cell is occupied, mark it occupied."""
+    """Create a downsampled occupancy grid."""
     if not map_data:
         return None
 
@@ -549,7 +524,7 @@ def inflate_coarse_grid(coarse, robot_width=ROBOT_WIDTH):
 
 
 def astar_plan(coarse, start_xy, goal_xy):
-    """A* on coarse grid. start_xy/goal_xy are world coords (meters). Returns list of world points (x,y)."""
+    """A* on coarse grid. Returns list of world points (x,y)."""
     if coarse is None:
         return []
 
@@ -620,7 +595,6 @@ def astar_plan(coarse, start_xy, goal_xy):
     if goal not in came_from and start != goal:
         return []
 
-    # Reconstruct path indices
     path_idx = [goal]
     cur = goal
     while cur != start:
@@ -630,13 +604,11 @@ def astar_plan(coarse, start_xy, goal_xy):
         path_idx.append(cur)
     path_idx.reverse()
 
-    # Convert to world coords
     path = [to_world(px, py) for (px, py) in path_idx]
 
-    # Simplify path by line-of-sight pruning on coarse grid
+    # Simplify path
     simplified = []
     def bresenham_clear(a, b):
-        # a,b are world coords; check coarse cells along the line
         ax, ay = a
         bx, by = b
         ai, aj = to_idx(ax, ay)
@@ -662,22 +634,20 @@ def astar_plan(coarse, start_xy, goal_xy):
                 j += sj
         return True
 
-    last = path[0]
-    simplified.append(last)
-    for p in path[1:]:
-        if not bresenham_clear(last, p):
-            # we need to keep the previous point as waypoint
-            simplified.append(prev)
-            last = prev
-        prev = p
-    # Always append last point
-    if simplified[-1] != path[-1]:
-        simplified.append(path[-1])
-
-    # Remove first point if it's the robot coordinate (spec requirement)
-    if simplified and len(simplified) > 0:
-        # first point corresponds to start coarse cell center; exclude robot coordinate
-        simplified = simplified[1:]
+    if path:
+        last = path[0]
+        simplified.append(last)
+        prev = last
+        for p in path[1:]:
+            if not bresenham_clear(last, p):
+                simplified.append(prev)
+                last = prev
+            prev = p
+        if simplified[-1] != path[-1]:
+            simplified.append(path[-1])
+        # Remove first point (robot position)
+        if simplified and len(simplified) > 0:
+            simplified = simplified[1:]
 
     return simplified
 
@@ -715,7 +685,6 @@ class PlannerWorker:
             sx = slam_state.x
             sy = slam_state.y
 
-            # Save departure for return
             self.start_at_goal = (sx, sy)
 
             map_data = self.slam_processor.get_map()
@@ -728,8 +697,6 @@ class PlannerWorker:
                 self.path = planned
 
             print(f"[Planner] Planned path with {len(planned)} points to ({gx:.2f},{gy:.2f})")
-
-            # Small sleep to yield
             time.sleep(0.05)
 
 
@@ -750,10 +717,13 @@ def udp_receiver(shared_packet: AtomicSharedPacket, stop_event: threading.Event)
             
             try:
                 message = data.decode('utf-8')
+                # print(f"[DEBUG] Raw UDP received (first 100 chars): {message[:100]}...")
+                
                 scan_data = json.loads(message)
                 
                 if scan_data.get('type') == 'lidar_scan':
                     packet_id += 1
+                    # print(f"[DEBUG] LiDAR scan received, auto_navigate={scan_data.get('auto_navigate', 'unknown')}")
                     
                     ranges = tuple(scan_data.get('ranges', []))
                     angles = tuple(scan_data.get('angles', []))
@@ -779,10 +749,10 @@ def udp_receiver(shared_packet: AtomicSharedPacket, stop_event: threading.Event)
                     if packet_count % 100 == 0:
                         print(f"[Receiver] {packet_count} packets received, last packet_id: {packet_id}")
                         
-            except json.JSONDecodeError:
-                pass
+            except json.JSONDecodeError as e:
+                print(f"[DEBUG] JSON decode error: {e}, raw message: {message[:200]}...")
             except Exception as e:
-                print(f"[Receiver] Error: {e}")
+                print(f"[DEBUG] Error processing packet: {e}")
                 
         except socket.timeout:
             continue
@@ -792,11 +762,14 @@ def udp_receiver(shared_packet: AtomicSharedPacket, stop_event: threading.Event)
     udp_socket.close()
     print(f"[Receiver] Stopped. Total packets: {packet_count}, last packet_id: {packet_id}")
 
-
 async def websocket_broadcaster(shared_state: AtomicSharedState, slam_processor: SlamProcessor, planner: PlannerWorker, stop_event: threading.Event):
     """WebSocket broadcaster - sends pose at fixed rate, map at lower rate"""
     
     connected_clients = set()
+    
+    # UDP socket for sending commands/paths to robot
+    udp_cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_cmd_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     
     async def handle_client(websocket):
         print(f"[Broadcaster] Client connected from {websocket.remote_address}")
@@ -805,13 +778,20 @@ async def websocket_broadcaster(shared_state: AtomicSharedState, slam_processor:
             async for message in websocket:
                 try:
                     data = json.loads(message)
-                    # Messages from web client
+                    
                     if data.get('type') == 'command':
                         cmd = data.get('command')
                         print(f"[Command] Received: {cmd}")
-                        # Forward manual commands to robot via UDP
+                        
+                        # Forward all commands to robot via UDP
                         try:
-                            udp_cmd_sock.sendto(f"CMD:{cmd}".encode('utf-8'), ('127.0.0.1', ROBOT_CMD_PORT))
+                            if cmd == 'auto':
+                                # Toggle auto mode - send both CMD and AUTO to ensure robot catches it
+                                udp_cmd_sock.sendto(f"CMD:auto".encode('utf-8'), ('127.0.0.1', ROBOT_CMD_PORT))
+                                # Also send explicit AUTO toggle
+                                # We'll let the robot handle the toggle via CMD:auto
+                            else:
+                                udp_cmd_sock.sendto(f"CMD:{cmd}".encode('utf-8'), ('127.0.0.1', ROBOT_CMD_PORT))
                         except Exception as e:
                             print(f"[Broadcaster] UDP cmd send error: {e}")
 
@@ -825,19 +805,24 @@ async def websocket_broadcaster(shared_state: AtomicSharedState, slam_processor:
                         auto = bool(data.get('auto_navigate', True))
                         print(f"[Broadcaster] Autonomy set: {auto}")
                         try:
-                            udp_cmd_sock.sendto(("AUTO:1" if auto else "AUTO:0").encode('utf-8'), ('127.0.0.1', ROBOT_CMD_PORT))
+                            # Send both the command and the explicit autonomy message
+                            if auto:
+                                udp_cmd_sock.sendto(f"AUTO:1".encode('utf-8'), ('127.0.0.1', ROBOT_CMD_PORT))
+                            else:
+                                udp_cmd_sock.sendto(f"AUTO:0".encode('utf-8'), ('127.0.0.1', ROBOT_CMD_PORT))
+                                # Also send a stop command when disabling auto
+                                udp_cmd_sock.sendto(f"CMD:stop".encode('utf-8'), ('127.0.0.1', ROBOT_CMD_PORT))
                         except Exception as e:
                             print(f"[Broadcaster] UDP auto send error: {e}")
-                except:
-                    pass
+                            
+                except json.JSONDecodeError as e:
+                    print(f"[Broadcaster] JSON parse error: {e}")
+                except Exception as e:
+                    print(f"[Broadcaster] Error handling message: {e}")
         except websockets.exceptions.ConnectionClosed:
             print(f"[Broadcaster] Client disconnected")
         finally:
             connected_clients.discard(websocket)
-    
-    # UDP socket for sending commands/paths to robot
-    udp_cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    udp_cmd_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
     async with websockets.serve(handle_client, "0.0.0.0", WEBSOCKET_PORT):
         print(f"[Broadcaster] WebSocket server on ws://0.0.0.0:{WEBSOCKET_PORT}")
@@ -856,18 +841,15 @@ async def websocket_broadcaster(shared_state: AtomicSharedState, slam_processor:
             slam_state = shared_state.get_latest()
             
             if slam_state and connected_clients:
-                # Send FULL lidar_scan message (what the client expects) at fixed rate
                 if now - last_pose_broadcast >= pose_interval:
-                    last_pose_broadcast = now
-                    
-                    # Build the exact message format that script.js expects
+                    last_pose_broadcast = now                    
                     output_message = {
                         "type": "lidar_scan",
                         "timestamp": slam_state.timestamp,
                         "num_points": len(slam_state.ranges),
                         "min_range": MIN_RANGE,
                         "max_range": MAX_RANGE,
-                        "fov": 6.283,  # 2*pi
+                        "fov": 6.283,
                         "ranges": list(slam_state.ranges),
                         "angles": list(slam_state.angles),
                         "robot_x": slam_state.x,
@@ -879,7 +861,7 @@ async def websocket_broadcaster(shared_state: AtomicSharedState, slam_processor:
                         "pose_source": "slam",
                         "left_speed": slam_state.left_speed,
                         "right_speed": slam_state.right_speed,
-                        "auto_navigate": slam_state.auto_navigate,
+                        "auto_navigate": slam_state.auto_navigate,  # Pass through the robot's auto state
                         "linear_vel": slam_state.linear_vel,
                         "angular_vel": slam_state.angular_vel,
                         "slam_match_score": slam_state.match_score,
@@ -887,22 +869,18 @@ async def websocket_broadcaster(shared_state: AtomicSharedState, slam_processor:
                         "scan_matching_skipped": slam_state.scan_matching_skipped,
                     }
                     
-                    # Add map periodically
                     if now - last_map_broadcast >= map_interval:
                         output_message["map"] = slam_processor.get_map()
                         last_map_broadcast = now
 
-                    # Add path if planner has one
                     current_path = planner.get_path() if planner is not None else []
                     if current_path:
                         output_message['path'] = [{'x': p[0], 'y': p[1]} for p in current_path]
 
-                    # Forward path to robot via UDP when it changes
                     if current_path:
                         sig = tuple((round(p[0],3), round(p[1],3)) for p in current_path)
                         if sig != last_sent_path_sig:
                             last_sent_path_sig = sig
-                            # Build simple PATH message: PATH:x1,y1;x2,y2;...
                             try:
                                 path_payload = 'PATH:' + ';'.join([f"{p[0]:.3f},{p[1]:.3f}" for p in current_path])
                                 udp_cmd_sock.sendto(path_payload.encode('utf-8'), ('127.0.0.1', ROBOT_CMD_PORT))
@@ -910,17 +888,15 @@ async def websocket_broadcaster(shared_state: AtomicSharedState, slam_processor:
                             except Exception as e:
                                 print(f"[Broadcaster] UDP path send error: {e}")
                     
-                    # Send to all connected clients
                     payload = json.dumps(output_message)
                     await asyncio.gather(*[client.send(payload) for client in connected_clients], return_exceptions=True)
                     
                     if slam_state.state_id != last_sent_state_id:
                         last_sent_state_id = slam_state.state_id
-                        # Uncomment for debug:
-                        # print(f"[Broadcaster] Sent state_id={slam_state.state_id}, pose=({slam_state.x:.2f}, {slam_state.y:.2f})")
             
             await asyncio.sleep(0.001)
         
+        udp_cmd_sock.close()
         print("[Broadcaster] Stopped")
 
 
@@ -937,7 +913,6 @@ async def main():
     slam_thread = threading.Thread(target=slam_processor.process_loop, args=(stop_event,), daemon=True)
     slam_thread.start()
 
-    # Planner worker
     planner = PlannerWorker(slam_processor, shared_state)
     planner_thread = threading.Thread(target=planner.planner_loop, args=(stop_event,), daemon=True)
     planner_thread.start()

@@ -43,6 +43,7 @@ let currentMap = null;
 let slamMatchScore = 0;
 let currentPath = [];
 let manualDriving = false; // when true, keyboard controls are forwarded to robot
+let showGridMap = true; // toggle for grid map visibility
 
 // Statistics
 let lastScanTime = 0;
@@ -50,6 +51,9 @@ let scanCount = 0;
 let scanRate = 0;
 let reconnectAttempts = 0;
 const maxReconnectAttempts = 5;
+
+// Axis range for map display (dynamic)
+let mapAxisRange = 10; // meters
 
 console.log('[App] Script loaded and ready');
 
@@ -280,35 +284,231 @@ function zoomMap(factor) {
     }
 }
 
-function drawMapGrid() {
-    mapCtx.strokeStyle = 'rgba(120, 128, 170, 0.12)';
-    mapCtx.lineWidth = 1;
+function toggleGridMap() {
+    showGridMap = !showGridMap;
+    const btn = document.getElementById('toggleGridBtn');
+    btn.textContent = showGridMap ? 'Hide Grid' : 'Show Grid';
+    if (activeView === 'map') {
+        renderMapView();
+    }
+}
 
-    const visibleWorldWidth = mapCanvas.width / mapView.zoom;
-    const visibleWorldHeight = mapCanvas.height / mapView.zoom;
+function drawMapAxes() {
+    const canvasWidth = mapCanvas.width;
+    const canvasHeight = mapCanvas.height;
+    
+    // Determine the visible world range
+    const visibleWorldWidth = canvasWidth / mapView.zoom;
+    const visibleWorldHeight = canvasHeight / mapView.zoom;
     const leftWorld = mapView.centerX - visibleWorldWidth / 2;
     const rightWorld = mapView.centerX + visibleWorldWidth / 2;
     const bottomWorld = mapView.centerY - visibleWorldHeight / 2;
     const topWorld = mapView.centerY + visibleWorldHeight / 2;
-
-    const step = 1.0;
-    const startX = Math.floor(leftWorld / step) * step;
-    const startY = Math.floor(bottomWorld / step) * step;
-
-    for (let x = startX; x <= rightWorld + step; x += step) {
-        const screen = worldToMapScreen(x, bottomWorld);
+    
+    // Find a nice step size for axis labels
+    let range = Math.max(visibleWorldWidth, visibleWorldHeight);
+    let step = Math.pow(10, Math.floor(Math.log10(range / 5)));
+    if (range / step < 4) step /= 2;
+    if (range / step < 2) step /= 2;
+    
+    // Draw the origin axes (bold lines at x=0, y=0 if visible)
+    mapCtx.strokeStyle = 'rgba(100, 100, 150, 0.3)';
+    mapCtx.lineWidth = 1;
+    
+    // Check if origin is visible
+    if (leftWorld <= 0 && rightWorld >= 0) {
+        const originScreen = worldToMapScreen(0, 0);
         mapCtx.beginPath();
-        mapCtx.moveTo(screen.x, 0);
-        mapCtx.lineTo(screen.x, mapCanvas.height);
+        mapCtx.moveTo(originScreen.x, 0);
+        mapCtx.lineTo(originScreen.x, canvasHeight);
         mapCtx.stroke();
+        
+        // Label the Y-axis (at x=0)
+        mapCtx.fillStyle = '#555';
+        mapCtx.font = '10px Arial';
+        mapCtx.fillText('Y', originScreen.x + 4, 14);
+    }
+    
+    if (bottomWorld <= 0 && topWorld >= 0) {
+        const originScreen = worldToMapScreen(0, 0);
+        mapCtx.beginPath();
+        mapCtx.moveTo(0, originScreen.y);
+        mapCtx.lineTo(canvasWidth, originScreen.y);
+        mapCtx.stroke();
+        
+        // Label the X-axis (at y=0)
+        mapCtx.fillStyle = '#555';
+        mapCtx.font = '10px Arial';
+        mapCtx.fillText('X', canvasWidth - 20, originScreen.y - 4);
+    }
+    
+    // Draw X-axis ticks and labels (along the bottom edge of the visible area)
+    const yPosForXLabels = bottomWorld;
+    const xStart = Math.ceil(leftWorld / step) * step;
+    const xEnd = Math.floor(rightWorld / step) * step;
+    
+    mapCtx.fillStyle = '#666';
+    mapCtx.font = '9px Arial';
+    mapCtx.textAlign = 'center';
+    mapCtx.textBaseline = 'top';
+    
+    for (let x = xStart; x <= xEnd; x += step) {
+        if (Math.abs(x) < 0.001) continue; // Skip origin (already labeled)
+        const screen = worldToMapScreen(x, yPosForXLabels);
+        if (screen.x >= 0 && screen.x <= canvasWidth) {
+            // Tick mark
+            mapCtx.strokeStyle = 'rgba(80, 80, 120, 0.3)';
+            mapCtx.lineWidth = 1;
+            mapCtx.beginPath();
+            mapCtx.moveTo(screen.x, screen.y + 4);
+            mapCtx.lineTo(screen.x, screen.y + 10);
+            mapCtx.stroke();
+            
+            // Label
+            mapCtx.fillStyle = '#666';
+            mapCtx.fillText(x.toFixed(1), screen.x, screen.y + 12);
+        }
+    }
+    
+    // Draw Y-axis ticks and labels (along the left edge of the visible area)
+    const xPosForYLabels = leftWorld;
+    const yStart = Math.ceil(bottomWorld / step) * step;
+    const yEnd = Math.floor(topWorld / step) * step;
+    
+    mapCtx.textAlign = 'right';
+    mapCtx.textBaseline = 'middle';
+    
+    for (let y = yStart; y <= yEnd; y += step) {
+        if (Math.abs(y) < 0.001) continue; // Skip origin (already labeled)
+        const screen = worldToMapScreen(xPosForYLabels, y);
+        if (screen.y >= 0 && screen.y <= canvasHeight) {
+            // Tick mark
+            mapCtx.strokeStyle = 'rgba(80, 80, 120, 0.3)';
+            mapCtx.lineWidth = 1;
+            mapCtx.beginPath();
+            mapCtx.moveTo(screen.x - 4, screen.y);
+            mapCtx.lineTo(screen.x - 10, screen.y);
+            mapCtx.stroke();
+            
+            // Label
+            mapCtx.fillStyle = '#666';
+            mapCtx.fillText(y.toFixed(1), screen.x - 12, screen.y);
+        }
+    }
+    
+    // Draw corner origin indicator
+    mapCtx.textAlign = 'left';
+    mapCtx.textBaseline = 'bottom';
+    mapCtx.fillStyle = '#888';
+    mapCtx.font = '11px Arial';
+    mapCtx.fillText('0', 6, canvasHeight - 2);
+}
+
+function drawMapCells(mapData) {
+    if (!mapData || !mapData.data || !showGridMap) {
+        return;
     }
 
-    for (let y = startY; y <= topWorld + step; y += step) {
-        const screen = worldToMapScreen(leftWorld, y);
-        mapCtx.beginPath();
-        mapCtx.moveTo(0, screen.y);
-        mapCtx.lineTo(mapCanvas.width, screen.y);
-        mapCtx.stroke();
+    const mapWidth = mapData.width;
+    const mapHeight = mapData.height;
+    const resolution = mapData.resolution;
+    const mapOriginX = -mapWidth * resolution / 2;
+    const mapOriginY = -mapHeight * resolution / 2;
+    const cellSize = resolution * mapView.zoom;
+
+    // Skip drawing if cells are too small (performance)
+    if (cellSize < 0.5) {
+        // Draw a simplified version: only every 4th cell
+        const step = 4;
+        const visibleWorldWidth = mapCanvas.width / mapView.zoom;
+        const visibleWorldHeight = mapCanvas.height / mapView.zoom;
+        const leftWorld = mapView.centerX - visibleWorldWidth / 2 - resolution * step;
+        const rightWorld = mapView.centerX + visibleWorldWidth / 2 + resolution * step;
+        const bottomWorld = mapView.centerY - visibleWorldHeight / 2 - resolution * step;
+        const topWorld = mapView.centerY + visibleWorldHeight / 2 + resolution * step;
+
+        const gxStart = Math.max(0, Math.floor((leftWorld - mapOriginX) / resolution));
+        const gxEnd = Math.min(mapWidth - 1, Math.ceil((rightWorld - mapOriginX) / resolution));
+        const gyStart = Math.max(0, Math.floor((bottomWorld - mapOriginY) / resolution));
+        const gyEnd = Math.min(mapHeight - 1, Math.ceil((topWorld - mapOriginY) / resolution));
+
+        for (let gy = gyStart; gy <= gyEnd; gy += step) {
+            for (let gx = gxStart; gx <= gxEnd; gx += step) {
+                const value = mapData.data[gy * mapWidth + gx];
+                if (value < 0) continue;
+
+                const worldX = mapOriginX + gx * resolution;
+                const worldY = mapOriginY + gy * resolution;
+                const screen = worldToMapScreen(worldX, worldY);
+                const size = cellSize * step;
+
+                if (screen.x + size < 0 || screen.x > mapCanvas.width || 
+                    screen.y + size < 0 || screen.y > mapCanvas.height) {
+                    continue;
+                }
+
+                if (value >= 30) {
+                    mapCtx.fillStyle = 'rgba(255, 68, 68, 0.85)';
+                } else {
+                    mapCtx.fillStyle = 'rgba(101, 181, 255, 0.12)';
+                }
+                mapCtx.fillRect(screen.x, screen.y, size, size);
+            }
+        }
+        return;
+    }
+
+    // Normal drawing when cells are large enough
+    const visibleWorldWidth = mapCanvas.width / mapView.zoom;
+    const visibleWorldHeight = mapCanvas.height / mapView.zoom;
+    const leftWorld = mapView.centerX - visibleWorldWidth / 2 - resolution;
+    const rightWorld = mapView.centerX + visibleWorldWidth / 2 + resolution;
+    const bottomWorld = mapView.centerY - visibleWorldHeight / 2 - resolution;
+    const topWorld = mapView.centerY + visibleWorldHeight / 2 + resolution;
+
+    const gxStart = Math.max(0, Math.floor((leftWorld - mapOriginX) / resolution));
+    const gxEnd = Math.min(mapWidth - 1, Math.ceil((rightWorld - mapOriginX) / resolution));
+    const gyStart = Math.max(0, Math.floor((bottomWorld - mapOriginY) / resolution));
+    const gyEnd = Math.min(mapHeight - 1, Math.ceil((topWorld - mapOriginY) / resolution));
+
+    // Batch draw for performance
+    const batchSize = 500;
+    let batch = [];
+
+    for (let gy = gyStart; gy <= gyEnd; gy++) {
+        for (let gx = gxStart; gx <= gxEnd; gx++) {
+            const value = mapData.data[gy * mapWidth + gx];
+            if (value < 0) continue;
+
+            const worldX = mapOriginX + gx * resolution;
+            const worldY = mapOriginY + gy * resolution;
+            const screen = worldToMapScreen(worldX, worldY);
+
+            if (screen.x + cellSize < 0 || screen.x > mapCanvas.width || 
+                screen.y + cellSize < 0 || screen.y > mapCanvas.height) {
+                continue;
+            }
+
+            const color = value >= 30 ? 
+                'rgba(255, 68, 68, 0.85)' : 
+                'rgba(101, 181, 255, 0.12)';
+            
+            batch.push({x: screen.x, y: screen.y, w: cellSize, h: cellSize, color: color});
+            
+            if (batch.length >= batchSize) {
+                for (const item of batch) {
+                    mapCtx.fillStyle = item.color;
+                    mapCtx.fillRect(item.x, item.y, item.w, item.h);
+                }
+                batch = [];
+            }
+        }
+    }
+    
+    // Flush remaining batch
+    for (const item of batch) {
+        mapCtx.fillStyle = item.color;
+        mapCtx.fillRect(item.x, item.y, item.w, item.h);
     }
 }
 
@@ -355,64 +555,15 @@ function drawRobotOnMap() {
     mapCtx.fill();
 }
 
-function drawMapCells(mapData) {
-    if (!mapData || !mapData.data) {
-        return;
-    }
-
-    const mapWidth = mapData.width;
-    const mapHeight = mapData.height;
-    const resolution = mapData.resolution;
-    const mapOriginX = -mapWidth * resolution / 2;
-    const mapOriginY = -mapHeight * resolution / 2;
-    const cellSize = resolution * mapView.zoom;
-
-    const visibleWorldWidth = mapCanvas.width / mapView.zoom;
-    const visibleWorldHeight = mapCanvas.height / mapView.zoom;
-    const leftWorld = mapView.centerX - visibleWorldWidth / 2 - resolution;
-    const rightWorld = mapView.centerX + visibleWorldWidth / 2 + resolution;
-    const bottomWorld = mapView.centerY - visibleWorldHeight / 2 - resolution;
-    const topWorld = mapView.centerY + visibleWorldHeight / 2 + resolution;
-
-    const gxStart = Math.max(0, Math.floor((leftWorld - mapOriginX) / resolution));
-    const gxEnd = Math.min(mapWidth - 1, Math.ceil((rightWorld - mapOriginX) / resolution));
-    const gyStart = Math.max(0, Math.floor((bottomWorld - mapOriginY) / resolution));
-    const gyEnd = Math.min(mapHeight - 1, Math.ceil((topWorld - mapOriginY) / resolution));
-
-    for (let gy = gyStart; gy <= gyEnd; gy++) {
-        for (let gx = gxStart; gx <= gxEnd; gx++) {
-            const value = mapData.data[gy * mapWidth + gx];
-
-            if (value < 0) {
-                continue;
-            }
-
-            const worldX = mapOriginX + gx * resolution;
-            const worldY = mapOriginY + gy * resolution;
-            const screen = worldToMapScreen(worldX, worldY);
-
-            if (screen.x + cellSize < 0 || screen.x > mapCanvas.width || screen.y + cellSize < 0 || screen.y > mapCanvas.height) {
-                continue;
-            }
-
-            if (value >= 30) {
-                mapCtx.fillStyle = 'rgba(255, 68, 68, 0.95)';
-            } else {
-                mapCtx.fillStyle = 'rgba(101, 181, 255, 0.16)';
-            }
-
-            mapCtx.fillRect(screen.x, screen.y, cellSize, cellSize);
-        }
-    }
-}
-
 function renderMapView() {
     mapCtx.clearRect(0, 0, mapCanvas.width, mapCanvas.height);
     mapCtx.fillStyle = '#f4f7fb';
     mapCtx.fillRect(0, 0, mapCanvas.width, mapCanvas.height);
 
-    drawMapGrid();
+    // Draw axes instead of grid
+    drawMapAxes();
 
+    // Draw map cells (if enabled)
     if (currentMap) {
         drawMapCells(currentMap);
     }
@@ -426,6 +577,9 @@ function renderMapView() {
     mapCtx.font = '12px Arial';
     mapCtx.fillText(`zoom: ${mapView.zoom.toFixed(0)} px/m`, 12, 18);
     mapCtx.fillText(`pose: (${robotX.toFixed(2)}, ${robotY.toFixed(2)})`, 12, 34);
+    mapCtx.fillStyle = '#666';
+    mapCtx.font = '10px Arial';
+    mapCtx.fillText(`Grid: ${showGridMap ? 'ON' : 'OFF'}`, 12, 52);
 }
 
 function renderActiveView() {
@@ -517,7 +671,10 @@ function connectWebSocket() {
 
                 renderActiveView();
 
-                console.log(`[Update] ${data.pose_source || 'slam'} pose=(${robotX.toFixed(2)}, ${robotY.toFixed(2)}), score=${slamMatchScore.toFixed(3)}`);
+                // Debug: log occasionally
+                if (scanCount % 100 === 0) {
+                    console.log(`[Update] pose=(${robotX.toFixed(2)}, ${robotY.toFixed(2)}), score=${slamMatchScore.toFixed(3)}`);
+                }
             } else if (data.type === 'robot_info') {
                 document.getElementById('leftSpeed').innerHTML = (data.left_speed || 0).toFixed(2) + ' m/s';
                 document.getElementById('rightSpeed').innerHTML = (data.right_speed || 0).toFixed(2) + ' m/s';
@@ -570,14 +727,35 @@ function sendCommand(command) {
     console.log('[Command] Sent:', command);
 }
 
+function enableManualDriving() {
+    manualDriving = true;
+    const btn = document.getElementById('driveManualBtn');
+    btn.disabled = true;
+    document.getElementById('keyboardHint').style.display = 'block';
+    console.log('[Manual] Keyboard control enabled - Arrow keys to drive, Space=stop, Q=quit');
+    
+    // Send a message to the robot to switch to manual mode if needed
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'autonomy', auto_navigate: false }));
+    }
+}
+
+function disableManualDriving() {
+    manualDriving = false;
+    const btn = document.getElementById('driveManualBtn');
+    btn.disabled = false;
+    document.getElementById('keyboardHint').style.display = 'none';
+    console.log('[Manual] Keyboard control disabled');
+}
+
 function setupKeyboardControls() {
     document.addEventListener('keydown', function(event) {
         // Toggle manual driving off with 'q'
         if (event.key === 'q' || event.key === 'Q') {
             if (manualDriving) {
-                manualDriving = false;
-                const btn = document.getElementById('driveManualBtn');
-                if (btn) btn.disabled = false;
+                disableManualDriving();
+                // Send stop command when quitting manual mode
+                sendCommand('stop');
             }
             return;
         }
@@ -606,14 +784,17 @@ function setupKeyboardControls() {
                     event.preventDefault();
                     break;
                 case 'a':
+                case 'A':
                     sendCommand('auto');
                     event.preventDefault();
                     break;
                 case 'm':
+                case 'M':
                     showView('map');
                     event.preventDefault();
                     break;
                 case 'r':
+                case 'R':
                     showView('radar');
                     event.preventDefault();
                     break;
@@ -666,24 +847,21 @@ function setupMapInteractions() {
         const scaleX = mapCanvas.width / rect.width;
         const scaleY = mapCanvas.height / rect.height;
         
-        // Get cursor position relative to canvas in canvas coordinates
         const mouseX = (event.clientX - rect.left) * scaleX;
         const mouseY = (event.clientY - rect.top) * scaleY;
 
         const zoomFactor = event.deltaY < 0 ? 1.12 : 1 / 1.12;
         
-        // Get the world coordinates of the point under the cursor
         const mouseWorld = mapScreenToWorld(mouseX, mouseY);
         
-        // Apply zoom
         mapView.zoom = clamp(mapView.zoom * zoomFactor, 10, 180);
         
-        // Adjust center so that the point under cursor stays at the same screen position
         mapView.centerX = mouseWorld.x - (mouseX - mapCanvas.width / 2) / mapView.zoom;
         mapView.centerY = mouseWorld.y - (mouseY - mapCanvas.height / 2) / mapView.zoom;
 
         renderMapView();
     }, { passive: false });
+    
     // Double-click to set a goal
     mapCanvas.addEventListener('dblclick', function(event) {
         if (activeView !== 'map') return;
@@ -724,20 +902,13 @@ window.addEventListener('load', function() {
     updateZoomDisplay();
     showView('map');
 
+    // Set initial grid toggle button text
+    document.getElementById('toggleGridBtn').textContent = 'Hide Grid';
+
     setTimeout(() => {
         console.log('[App] Auto-connecting...');
         connectWebSocket();
     }, 1000);
-
-    // Drive Manually button
-    const driveBtn = document.getElementById('driveManualBtn');
-    if (driveBtn) {
-        driveBtn.addEventListener('click', function() {
-            manualDriving = true;
-            driveBtn.disabled = true;
-            console.log('[Manual] Keyboard control enabled');
-        });
-    }
 
     document.getElementById('wsUrl').addEventListener('keypress', function(event) {
         if (event.key === 'Enter') {
