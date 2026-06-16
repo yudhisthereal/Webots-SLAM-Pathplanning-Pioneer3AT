@@ -46,6 +46,9 @@ SCAN_MATCH_TRANSLATION_RANGE = 0.20
 SCAN_MATCH_TRANSLATION_STEP = 0.05
 SCAN_MATCH_MIN_IMPROVEMENT = 0.05
 
+# Angular velocity threshold for scan matching and map updates (rad/s)
+ANGULAR_VEL_THRESHOLD = 0.2  # Skip scan matching and map updates if angular velocity exceeds this
+
 # Coordinate system fix
 FLIP_THETA_FOR_VISUALIZATION = True
 FLIP_ROBOT_Y_FROM_SIM = True
@@ -93,6 +96,7 @@ class SlamState:
     auto_navigate: bool = True
     linear_vel: float = 0
     angular_vel: float = 0
+    scan_matching_skipped: bool = False  # Flag to indicate if scan matching was skipped
 
 
 def wrap_angle(angle):
@@ -114,6 +118,7 @@ print(f"WebSocket Port: {WEBSOCKET_PORT}")
 print(f"Pose broadcast: {BROADCAST_POSE_HZ} Hz")
 print(f"Map broadcast: {BROADCAST_MAP_HZ} Hz")
 print(f"Correction Weight: {CORRECTION_WEIGHT * 100:.0f}%")
+print(f"Angular velocity threshold: {ANGULAR_VEL_THRESHOLD} rad/s ({ANGULAR_VEL_THRESHOLD * 180 / math.pi:.1f}°/s)")
 print("=" * 60)
 
 
@@ -370,6 +375,7 @@ class SlamProcessor:
         # Statistics
         self.processed_count = 0
         self.state_id = 0
+        self.skipped_count = 0  # Count of skipped updates due to high angular velocity
     
     def process_loop(self, stop_event: threading.Event):
         """Main processing loop - runs in its own thread"""
@@ -393,7 +399,7 @@ class SlamProcessor:
             # Debug output every 2 seconds
             if time.time() - last_debug > 2.0 and self.processed_count > 0:
                 last_debug = time.time()
-                print(f"[SLAM] Processed {self.processed_count} scans, "
+                print(f"[SLAM] Processed {self.processed_count} scans, {self.skipped_count} skipped, "
                       f"pose=({self.slam_x:.2f}, {self.slam_y:.2f}, {math.degrees(self.slam_theta):.1f}°), "
                       f"last packet_id: {packet.packet_id}")
     
@@ -401,14 +407,23 @@ class SlamProcessor:
         """Process a single packet and update SLAM state"""
         self.processed_count += 1
         
+        # Check angular velocity - skip scan matching and map update if rotating too fast
+        angular_vel_abs = abs(packet.angular_vel)
+        is_rotating_fast = angular_vel_abs > ANGULAR_VEL_THRESHOLD
+        
+        if is_rotating_fast:
+            self.skipped_count += 1
+            if self.skipped_count % 100 == 0:  # Log every 100 skipped updates
+                print(f"[SLAM] Skipping scan matching and map update (angular_vel={angular_vel_abs:.3f} rad/s > {ANGULAR_VEL_THRESHOLD} rad/s)")
+        
         # Start with raw odometry
         current_x = packet.robot_x
         current_y = -packet.robot_y if FLIP_ROBOT_Y_FROM_SIM else packet.robot_y
-        current_theta  = packet.robot_theta
+        current_theta = packet.robot_theta
         match_score = 0.0
         
-        # Apply scan matching if enabled and map is ready
-        if ENABLE_SCAN_MATCHING and self.map_grid.is_ready_for_scan_matching():
+        # Apply scan matching ONLY if not rotating too fast AND map is ready
+        if not is_rotating_fast and ENABLE_SCAN_MATCHING and self.map_grid.is_ready_for_scan_matching():
             refined_x, refined_y, refined_theta, match_score = self.map_grid.refine_pose(
                 current_x, current_y, current_theta, packet.ranges, packet.angles
             )
@@ -430,12 +445,11 @@ class SlamProcessor:
             self.slam_y = current_y
             self.slam_theta = current_theta
         
-        # print("angles: ", packet.angles)
-        # print("ranges: ", packet.ranges)
-        
-        # Update occupancy grid
-        self.map_grid.update(self.slam_x, self.slam_y, self.slam_theta, 
-                            packet.ranges, packet.angles, packet.packet_id)
+        # Update occupancy grid ONLY if not rotating too fast
+        map_updated = False
+        if not is_rotating_fast:
+            map_updated = self.map_grid.update(self.slam_x, self.slam_y, self.slam_theta, 
+                                               packet.ranges, packet.angles, packet.packet_id)
         
         # Create new immutable SlamState with all data needed for client
         self.state_id += 1
@@ -445,7 +459,7 @@ class SlamProcessor:
             x=self.slam_x,
             y=self.slam_y,
             theta=self.slam_theta,
-            match_score=match_score,
+            match_score=match_score if not is_rotating_fast else 0.0,
             packet_id_processed=packet.packet_id,
             ranges=packet.ranges,
             angles=packet.angles,
@@ -456,7 +470,8 @@ class SlamProcessor:
             right_speed=packet.right_speed,
             auto_navigate=packet.auto_navigate,
             linear_vel=packet.linear_vel,
-            angular_vel=packet.angular_vel
+            angular_vel=packet.angular_vel,
+            scan_matching_skipped=is_rotating_fast
         )
         
         # Update shared state for broadcaster
@@ -592,6 +607,7 @@ async def websocket_broadcaster(shared_state: AtomicSharedState, slam_processor:
                         "angular_vel": slam_state.angular_vel,
                         "slam_match_score": slam_state.match_score,
                         "correction_weight": CORRECTION_WEIGHT if ENABLE_SCAN_MATCHING else 0.0,
+                        "scan_matching_skipped": slam_state.scan_matching_skipped,
                     }
                     
                     # Add map periodically
