@@ -3,7 +3,6 @@
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/backgrounds/protos/TexturedBackground.proto"
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/backgrounds/protos/TexturedBackgroundLight.proto"
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/floors/protos/RectangleArena.proto"
-EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/robots/adept/pioneer3/protos/Pioneer3at.proto"
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/animals/protos/Cat.proto"
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/chairs/protos/Chair.proto"
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/chairs/protos/OfficeChair.proto"
@@ -27,13 +26,14 @@ EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/project
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/factory/containers/protos/CardboardBox.proto"
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/factory/containers/protos/MetalStorageBox.proto"
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/street_furniture/protos/MetallicTrash.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/robots/adept/pioneer3/protos/Pioneer3dx.proto"
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/devices/slamtec/protos/RpLidarA2.proto"
 
 WorldInfo {
 }
 Viewpoint {
-  orientation 0.0019293685239981154 -0.9999962251154133 -0.00195634660072777 4.724882586416402
-  position -1.379129342703643 -2.3930649769812513 32.47902329453869
+  orientation 0.7062230459006613 0.0008001935118925832 -0.7079889611633335 3.1399844700535233
+  position -1.022518830537494 -2.2812127153085737 23.23280284370462
 }
 TexturedBackground {
 }
@@ -42,6 +42,18 @@ TexturedBackgroundLight {
 RectangleArena {
   floorSize 100 100
   floorTileSize 1 1
+}
+Pioneer3dx {
+  translation -3.81 2.7 0.0975
+  rotation 0 0 1 1.5708
+  controller "odometry-test-p3dx"
+  extensionSlot [
+    RpLidarA2 {
+      translation -0.01 -1.16758e-06 0.171
+      rotation 0 0 1 -5.307179586466759e-06
+      name "lidar"
+    }
+  ]
 }
 Door {
   translation -4.92 -5.49 0
@@ -247,17 +259,6 @@ Window {
   translation -0.309994 -9.54 0
   rotation 0 0 1 -1.5707953071795862
   name "window(4)"
-}
-Pioneer3at {
-  translation -4.21004 3.63 0
-  rotation 0 0 -1 1.57079
-  controller "slam-pathfinder"
-  extensionSlot [
-    RpLidarA2 {
-      translation 0.22 0 0.301
-      name "lidar"
-    }
-  ]
 }
 BunchOfSunFlowers {
   translation 2.25 -9.26 0

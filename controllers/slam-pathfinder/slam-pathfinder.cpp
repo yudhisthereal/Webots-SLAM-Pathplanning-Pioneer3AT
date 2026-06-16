@@ -63,8 +63,9 @@ public:
 // Odometry calculator with velocity
 class Odometry {
 private:
-    double wheelRadius = 0.097;    // meters (from Pioneer 3-AT spec)
-    double wheelBase = 0.45;        // meters (distance between left and right wheels)
+    // Pioneer 3-AT parameters (source of truth: from Pioneer 3-AT proto file: https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/robots/adept/pioneer3/protos/Pioneer3at.proto)
+    double wheelRadius = 0.11;    // meters
+    double wheelBase = 0.2662;    // meters
     double prevLeftPos = 0;
     double prevRightPos = 0;
     double prevTime = 0;
@@ -227,6 +228,11 @@ int main(int argc, char **argv) {
             odom.update(leftPos, rightPos, currentTime);
             odom.getPose(robotX, robotY, robotTheta);
             odom.getVelocity(linearVel, angularVel);
+
+            cout << fixed << setprecision(3)
+                << leftPos << " "
+                << rightPos << " "
+                << robotTheta << endl;
         }
         
         if (rangeImage != NULL) {

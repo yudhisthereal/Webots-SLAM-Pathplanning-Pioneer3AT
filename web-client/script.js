@@ -670,7 +670,7 @@ window.addEventListener('load', function() {
     document.getElementById('linearVel').innerHTML = '0.00 m/s';
 
     updateZoomDisplay();
-    showView('radar');
+    showView('map');
 
     setTimeout(() => {
         console.log('[App] Auto-connecting...');
