@@ -637,12 +637,25 @@ function setupMapInteractions() {
 
         event.preventDefault();
 
-        const zoomFactor = event.deltaY < 0 ? 1.12 : 1 / 1.12;
-        const mouseWorld = mapScreenToWorld(event.offsetX, event.offsetY);
-        mapView.zoom = clamp(mapView.zoom * zoomFactor, 10, 180);
+        const rect = mapCanvas.getBoundingClientRect();
+        const scaleX = mapCanvas.width / rect.width;
+        const scaleY = mapCanvas.height / rect.height;
+        
+        // Get cursor position relative to canvas in canvas coordinates
+        const mouseX = (event.clientX - rect.left) * scaleX;
+        const mouseY = (event.clientY - rect.top) * scaleY;
 
-        mapView.centerX = mouseWorld.x - (event.offsetX - mapCanvas.width / 2) / mapView.zoom;
-        mapView.centerY = mouseWorld.y + (event.offsetY - mapCanvas.height / 2) / mapView.zoom;
+        const zoomFactor = event.deltaY < 0 ? 1.12 : 1 / 1.12;
+        
+        // Get the world coordinates of the point under the cursor
+        const mouseWorld = mapScreenToWorld(mouseX, mouseY);
+        
+        // Apply zoom
+        mapView.zoom = clamp(mapView.zoom * zoomFactor, 10, 180);
+        
+        // Adjust center so that the point under cursor stays at the same screen position
+        mapView.centerX = mouseWorld.x - (mouseX - mapCanvas.width / 2) / mapView.zoom;
+        mapView.centerY = mouseWorld.y - (mouseY - mapCanvas.height / 2) / mapView.zoom;
 
         renderMapView();
     }, { passive: false });
