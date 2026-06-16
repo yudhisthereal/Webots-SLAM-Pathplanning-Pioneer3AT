@@ -17,6 +17,9 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <vector>
+#include <sstream>
 
 using namespace webots;
 using namespace std;
@@ -219,6 +222,28 @@ int main(int argc, char **argv) {
     // Initialize UDP broadcaster
     UDPBroadcaster udp(8765);
     cout << "[UDP] Broadcasting on port 8765" << endl;
+
+    // UDP receiver for commands from bridge
+    int cmd_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (cmd_sock < 0) {
+        cerr << "[UDP] Command socket creation failed" << endl;
+    } else {
+        struct sockaddr_in cmd_addr;
+        memset(&cmd_addr, 0, sizeof(cmd_addr));
+        cmd_addr.sin_family = AF_INET;
+        cmd_addr.sin_port = htons(8767);
+        cmd_addr.sin_addr.s_addr = INADDR_ANY;
+        if (bind(cmd_sock, (struct sockaddr*)&cmd_addr, sizeof(cmd_addr)) < 0) {
+            cerr << "[UDP] Command socket bind failed" << endl;
+            close(cmd_sock);
+            cmd_sock = -1;
+        } else {
+            // set non-blocking
+            int flags = fcntl(cmd_sock, F_GETFL, 0);
+            fcntl(cmd_sock, F_SETFL, flags | O_NONBLOCK);
+            cout << "[UDP] Command listener on port 8767" << endl;
+        }
+    }
     
     // Initialize LiDAR
     Lidar *lidar = robot->getLidar("lidar");
@@ -331,6 +356,10 @@ int main(int argc, char **argv) {
     
     Odometry odom;
     VelocitySmoother smoother(0.15);  // Smoothing factor 0.15 for gradual transitions
+
+    bool autoMode = false; // set by bridge
+    std::vector<std::pair<double,double>> pathPoints;
+    size_t pathIndex = 0;
     
     // Control variables
     double targetLeftSpeed = 0.0;
@@ -466,6 +495,74 @@ int main(int argc, char **argv) {
         } else {
             smoother.update(0.032);  // Use default timestep if dt is invalid
         }
+
+        // Poll for incoming command messages from bridge (non-blocking)
+        if (cmd_sock >= 0) {
+            char buf[65536];
+            struct sockaddr_in src;
+            socklen_t srclen = sizeof(src);
+            ssize_t r = recvfrom(cmd_sock, buf, sizeof(buf)-1, 0, (struct sockaddr*)&src, &srclen);
+            if (r > 0) {
+                buf[r] = '\0';
+                std::string msg(buf);
+                // Simple protocol: CMD:forward|backward|left|right|stop
+                // AUTO:1 or AUTO:0
+                // PATH:x1,y1;x2,y2;...
+                if (msg.rfind("CMD:", 0) == 0) {
+                    std::string cmd = msg.substr(4);
+                    // Only accept manual commands when not in auto mode
+                    if (!autoMode) {
+                        if (cmd == "forward") {
+                            targetLeftSpeed = -maxSpeed;
+                            targetRightSpeed = -maxSpeed;
+                            smoother.setTarget(targetLeftSpeed, targetRightSpeed);
+                        } else if (cmd == "backward") {
+                            targetLeftSpeed = maxSpeed;
+                            targetRightSpeed = maxSpeed;
+                            smoother.setTarget(targetLeftSpeed, targetRightSpeed);
+                        } else if (cmd == "left") {
+                            targetLeftSpeed = -maxSpeed;
+                            targetRightSpeed = maxSpeed;
+                            smoother.setTarget(targetLeftSpeed, targetRightSpeed);
+                        } else if (cmd == "right") {
+                            targetLeftSpeed = maxSpeed;
+                            targetRightSpeed = -maxSpeed;
+                            smoother.setTarget(targetLeftSpeed, targetRightSpeed);
+                        } else if (cmd == "stop") {
+                            targetLeftSpeed = 0.0;
+                            targetRightSpeed = 0.0;
+                            smoother.setTarget(0.0, 0.0);
+                        }
+                    }
+                } else if (msg.rfind("AUTO:", 0) == 0) {
+                    std::string v = msg.substr(5);
+                    autoMode = (v == "1");
+                    if (autoMode) {
+                        cout << "[Auto] Autonomous mode enabled" << endl;
+                        // stop manual movement target adjustments
+                        targetLeftSpeed = 0.0; targetRightSpeed = 0.0;
+                        smoother.setTarget(0.0, 0.0);
+                    } else {
+                        cout << "[Auto] Autonomous mode disabled" << endl;
+                        // clear path
+                        pathPoints.clear(); pathIndex = 0;
+                    }
+                } else if (msg.rfind("PATH:", 0) == 0) {
+                    std::string body = msg.substr(5);
+                    pathPoints.clear();
+                    pathIndex = 0;
+                    std::stringstream ss(body);
+                    std::string pair;
+                    while (std::getline(ss, pair, ';')) {
+                        double px=0, py=0;
+                        if (sscanf(pair.c_str(), "%lf,%lf", &px, &py) == 2) {
+                            pathPoints.emplace_back(px, py);
+                        }
+                    }
+                    cout << "[Path] Received " << pathPoints.size() << " points" << endl;
+                }
+            }
+        }
         
         // Apply smooth motor commands
         leftMotor->setVelocity(smoother.getLeftSpeed());
@@ -559,6 +656,48 @@ int main(int argc, char **argv) {
                     // Send UDP packet
                     udp.send(json.str());
                 }
+            }
+        }
+
+        // Autonomous path following (simple behavioral controller)
+        if (autoMode && !pathPoints.empty()) {
+            double tx = pathPoints[pathIndex].first;
+            double ty = pathPoints[pathIndex].second;
+            double dxp = tx - odom.getX();
+            double dyp = ty - odom.getY();
+            double dist = sqrt(dxp*dxp + dyp*dyp);
+            double desired_heading = atan2(dyp, dxp);
+            double diff = desired_heading - odom.getTheta();
+            while (diff > M_PI) diff -= 2*M_PI;
+            while (diff < -M_PI) diff += 2*M_PI;
+
+            double turnThresh = 0.15; // radians
+            double reachThresh = 0.14; // meters
+            double turnSpeed = maxSpeed * 0.8;
+
+            if (dist < reachThresh) {
+                // reached waypoint
+                pathIndex++;
+                if (pathIndex >= pathPoints.size()) {
+                    // finish
+                    pathPoints.clear(); pathIndex = 0;
+                    smoother.setTarget(0.0, 0.0);
+                }
+            } else if (fabs(diff) > turnThresh) {
+                // rotate in place towards waypoint
+                if (diff > 0) {
+                    targetLeftSpeed = -turnSpeed;
+                    targetRightSpeed = turnSpeed;
+                } else {
+                    targetLeftSpeed = turnSpeed;
+                    targetRightSpeed = -turnSpeed;
+                }
+                smoother.setTarget(targetLeftSpeed, targetRightSpeed);
+            } else {
+                // move forward towards waypoint
+                targetLeftSpeed = -maxSpeed * 0.9;
+                targetRightSpeed = -maxSpeed * 0.9;
+                smoother.setTarget(targetLeftSpeed, targetRightSpeed);
             }
         }
         

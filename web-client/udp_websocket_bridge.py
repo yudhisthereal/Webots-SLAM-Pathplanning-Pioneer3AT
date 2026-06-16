@@ -13,6 +13,9 @@ import numpy as np
 import math
 import time
 import threading
+import heapq
+from typing import Deque
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional, List, Tuple
 
@@ -21,6 +24,13 @@ UDP_PORT = 8765
 WEBSOCKET_PORT = 8766
 BROADCAST_POSE_HZ = 30  # 30 Hz pose updates
 BROADCAST_MAP_HZ = 1    # 1 Hz map updates
+
+# Planner settings
+COARSE_FACTOR = 8  # how many fine cells per coarse cell
+ROBOT_WIDTH = 0.35  # meters (used to inflate obstacles)
+
+# UDP port robot listens on for commands/path
+ROBOT_CMD_PORT = 8767
 
 # Map parameters
 MAP_SIZE = 1880  # pixels
@@ -482,6 +492,247 @@ class SlamProcessor:
         return self.map_grid.get_map()
 
 
+def coarse_grid_from_map(map_data, coarse_factor=COARSE_FACTOR):
+    """Create a downsampled occupancy grid. If any fine cell inside a coarse cell is occupied, mark it occupied."""
+    if not map_data:
+        return None
+
+    width = map_data['width']
+    height = map_data['height']
+    res = map_data['resolution']
+    data = np.array(map_data['data'], dtype=np.int8).reshape((height, width))
+
+    cf = int(coarse_factor)
+    cw = max(1, width // cf)
+    ch = max(1, height // cf)
+    cres = res * cf
+
+    coarse = np.zeros((ch, cw), dtype=np.int8)
+
+    for cy in range(ch):
+        for cx in range(cw):
+            fx0 = cx * cf
+            fy0 = cy * cf
+            fx1 = min(width, fx0 + cf)
+            fy1 = min(height, fy0 + cf)
+            block = data[fy0:fy1, fx0:fx1]
+            if np.any(block == 100):
+                coarse[cy, cx] = 1
+    return {
+        'width': cw,
+        'height': ch,
+        'resolution': cres,
+        'origin_x': -width * res / 2.0,
+        'origin_y': -height * res / 2.0,
+        'data': coarse,
+    }
+
+
+def inflate_coarse_grid(coarse, robot_width=ROBOT_WIDTH):
+    if coarse is None:
+        return None
+    grid = coarse['data'].copy()
+    cres = coarse['resolution']
+    inflate_cells = int(math.ceil((robot_width / 2.0) / cres))
+    h, w = grid.shape
+    out = grid.copy()
+    for y in range(h):
+        for x in range(w):
+            if grid[y, x] == 1:
+                y0 = max(0, y - inflate_cells)
+                y1 = min(h - 1, y + inflate_cells)
+                x0 = max(0, x - inflate_cells)
+                x1 = min(w - 1, x + inflate_cells)
+                out[y0:y1+1, x0:x1+1] = 1
+    coarse['data'] = out
+    return coarse
+
+
+def astar_plan(coarse, start_xy, goal_xy):
+    """A* on coarse grid. start_xy/goal_xy are world coords (meters). Returns list of world points (x,y)."""
+    if coarse is None:
+        return []
+
+    w = coarse['width']
+    h = coarse['height']
+    cres = coarse['resolution']
+    ox = coarse['origin_x']
+    oy = coarse['origin_y']
+
+    def to_idx(x, y):
+        gx = int((x - ox) / cres)
+        gy = int((y - oy) / cres)
+        return gx, gy
+
+    def to_world(gx, gy):
+        x = ox + (gx + 0.5) * cres
+        y = oy + (gy + 0.5) * cres
+        return x, y
+
+    sx, sy = start_xy
+    gx, gy = goal_xy
+    si, sj = to_idx(sx, sy)
+    gi, gj = to_idx(gx, gy)
+
+    if si < 0 or sj < 0 or si >= w or sj >= h:
+        return []
+    if gi < 0 or gj < 0 or gi >= w or gj >= h:
+        return []
+    grid = coarse['data']
+    if grid[sj, si] == 1 or grid[gj, gi] == 1:
+        return []
+
+    def h_cost(a, b):
+        (x1, y1) = a
+        (x2, y2) = b
+        return math.hypot(x1 - x2, y1 - y2)
+
+    start = (si, sj)
+    goal = (gi, gj)
+
+    open_set = []
+    heapq.heappush(open_set, (0.0, start))
+    came_from = {}
+    gscore = {start: 0.0}
+
+    neighbors = [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)]
+
+    while open_set:
+        _, current = heapq.heappop(open_set)
+        if current == goal:
+            break
+
+        for dx, dy in neighbors:
+            nx = current[0] + dx
+            ny = current[1] + dy
+            if nx < 0 or ny < 0 or nx >= w or ny >= h:
+                continue
+            if grid[ny, nx] == 1:
+                continue
+            tentative_g = gscore[current] + (math.hypot(dx, dy))
+            neigh = (nx, ny)
+            if tentative_g < gscore.get(neigh, float('inf')):
+                came_from[neigh] = current
+                gscore[neigh] = tentative_g
+                f = tentative_g + h_cost(neigh, goal)
+                heapq.heappush(open_set, (f, neigh))
+
+    if goal not in came_from and start != goal:
+        return []
+
+    # Reconstruct path indices
+    path_idx = [goal]
+    cur = goal
+    while cur != start:
+        cur = came_from.get(cur)
+        if cur is None:
+            break
+        path_idx.append(cur)
+    path_idx.reverse()
+
+    # Convert to world coords
+    path = [to_world(px, py) for (px, py) in path_idx]
+
+    # Simplify path by line-of-sight pruning on coarse grid
+    simplified = []
+    def bresenham_clear(a, b):
+        # a,b are world coords; check coarse cells along the line
+        ax, ay = a
+        bx, by = b
+        ai, aj = to_idx(ax, ay)
+        bi, bj = to_idx(bx, by)
+        di = abs(bi - ai)
+        dj = abs(bj - aj)
+        si = 1 if ai < bi else -1
+        sj = 1 if aj < bj else -1
+        err = di - dj
+        i = ai
+        j = aj
+        while True:
+            if grid[j, i] == 1:
+                return False
+            if i == bi and j == bj:
+                break
+            e2 = 2 * err
+            if e2 > -dj:
+                err -= dj
+                i += si
+            if e2 < di:
+                err += di
+                j += sj
+        return True
+
+    last = path[0]
+    simplified.append(last)
+    for p in path[1:]:
+        if not bresenham_clear(last, p):
+            # we need to keep the previous point as waypoint
+            simplified.append(prev)
+            last = prev
+        prev = p
+    # Always append last point
+    if simplified[-1] != path[-1]:
+        simplified.append(path[-1])
+
+    # Remove first point if it's the robot coordinate (spec requirement)
+    if simplified and len(simplified) > 0:
+        # first point corresponds to start coarse cell center; exclude robot coordinate
+        simplified = simplified[1:]
+
+    return simplified
+
+
+class PlannerWorker:
+    def __init__(self, slam_processor, shared_state):
+        self.slam_processor = slam_processor
+        self.shared_state = shared_state
+        self.goal = None
+        self.path = []
+        self.start_at_goal = None
+        self.lock = threading.Lock()
+        self.request_queue: Deque = deque()
+
+    def set_goal(self, x, y):
+        with self.lock:
+            self.request_queue.append((x, y))
+
+    def get_path(self):
+        with self.lock:
+            return list(self.path)
+
+    def planner_loop(self, stop_event: threading.Event):
+        print("[Planner] Thread started")
+        while not stop_event.is_set():
+            if not self.request_queue:
+                time.sleep(0.05)
+                continue
+
+            with self.lock:
+                gx, gy = self.request_queue.popleft()
+            slam_state = self.shared_state.get_latest()
+            if slam_state is None:
+                continue
+            sx = slam_state.x
+            sy = slam_state.y
+
+            # Save departure for return
+            self.start_at_goal = (sx, sy)
+
+            map_data = self.slam_processor.get_map()
+            coarse = coarse_grid_from_map(map_data)
+            coarse = inflate_coarse_grid(coarse, ROBOT_WIDTH)
+            planned = astar_plan(coarse, (sx, sy), (gx, gy))
+
+            with self.lock:
+                self.goal = (gx, gy)
+                self.path = planned
+
+            print(f"[Planner] Planned path with {len(planned)} points to ({gx:.2f},{gy:.2f})")
+
+            # Small sleep to yield
+            time.sleep(0.05)
+
+
 def udp_receiver(shared_packet: AtomicSharedPacket, stop_event: threading.Event):
     """UDP receiver thread - only receives packets and updates shared state"""
     udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -542,7 +793,7 @@ def udp_receiver(shared_packet: AtomicSharedPacket, stop_event: threading.Event)
     print(f"[Receiver] Stopped. Total packets: {packet_count}, last packet_id: {packet_id}")
 
 
-async def websocket_broadcaster(shared_state: AtomicSharedState, slam_processor: SlamProcessor, stop_event: threading.Event):
+async def websocket_broadcaster(shared_state: AtomicSharedState, slam_processor: SlamProcessor, planner: PlannerWorker, stop_event: threading.Event):
     """WebSocket broadcaster - sends pose at fixed rate, map at lower rate"""
     
     connected_clients = set()
@@ -554,8 +805,29 @@ async def websocket_broadcaster(shared_state: AtomicSharedState, slam_processor:
             async for message in websocket:
                 try:
                     data = json.loads(message)
+                    # Messages from web client
                     if data.get('type') == 'command':
-                        print(f"[Command] Received: {data.get('command')}")
+                        cmd = data.get('command')
+                        print(f"[Command] Received: {cmd}")
+                        # Forward manual commands to robot via UDP
+                        try:
+                            udp_cmd_sock.sendto(f"CMD:{cmd}".encode('utf-8'), ('127.0.0.1', ROBOT_CMD_PORT))
+                        except Exception as e:
+                            print(f"[Broadcaster] UDP cmd send error: {e}")
+
+                    elif data.get('type') == 'set_goal':
+                        gx = float(data.get('x', 0.0))
+                        gy = float(data.get('y', 0.0))
+                        print(f"[Broadcaster] Goal set by client: ({gx:.2f},{gy:.2f})")
+                        planner.set_goal(gx, gy)
+
+                    elif data.get('type') == 'autonomy':
+                        auto = bool(data.get('auto_navigate', True))
+                        print(f"[Broadcaster] Autonomy set: {auto}")
+                        try:
+                            udp_cmd_sock.sendto(("AUTO:1" if auto else "AUTO:0").encode('utf-8'), ('127.0.0.1', ROBOT_CMD_PORT))
+                        except Exception as e:
+                            print(f"[Broadcaster] UDP auto send error: {e}")
                 except:
                     pass
         except websockets.exceptions.ConnectionClosed:
@@ -563,6 +835,10 @@ async def websocket_broadcaster(shared_state: AtomicSharedState, slam_processor:
         finally:
             connected_clients.discard(websocket)
     
+    # UDP socket for sending commands/paths to robot
+    udp_cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_cmd_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
     async with websockets.serve(handle_client, "0.0.0.0", WEBSOCKET_PORT):
         print(f"[Broadcaster] WebSocket server on ws://0.0.0.0:{WEBSOCKET_PORT}")
         
@@ -572,6 +848,7 @@ async def websocket_broadcaster(shared_state: AtomicSharedState, slam_processor:
         last_pose_broadcast = 0
         last_map_broadcast = 0
         last_sent_state_id = -1
+        last_sent_path_sig = None
         
         while not stop_event.is_set():
             now = time.time()
@@ -614,6 +891,24 @@ async def websocket_broadcaster(shared_state: AtomicSharedState, slam_processor:
                     if now - last_map_broadcast >= map_interval:
                         output_message["map"] = slam_processor.get_map()
                         last_map_broadcast = now
+
+                    # Add path if planner has one
+                    current_path = planner.get_path() if planner is not None else []
+                    if current_path:
+                        output_message['path'] = [{'x': p[0], 'y': p[1]} for p in current_path]
+
+                    # Forward path to robot via UDP when it changes
+                    if current_path:
+                        sig = tuple((round(p[0],3), round(p[1],3)) for p in current_path)
+                        if sig != last_sent_path_sig:
+                            last_sent_path_sig = sig
+                            # Build simple PATH message: PATH:x1,y1;x2,y2;...
+                            try:
+                                path_payload = 'PATH:' + ';'.join([f"{p[0]:.3f},{p[1]:.3f}" for p in current_path])
+                                udp_cmd_sock.sendto(path_payload.encode('utf-8'), ('127.0.0.1', ROBOT_CMD_PORT))
+                                print(f"[Broadcaster] Sent PATH with {len(current_path)} points to robot")
+                            except Exception as e:
+                                print(f"[Broadcaster] UDP path send error: {e}")
                     
                     # Send to all connected clients
                     payload = json.dumps(output_message)
@@ -641,9 +936,14 @@ async def main():
     
     slam_thread = threading.Thread(target=slam_processor.process_loop, args=(stop_event,), daemon=True)
     slam_thread.start()
+
+    # Planner worker
+    planner = PlannerWorker(slam_processor, shared_state)
+    planner_thread = threading.Thread(target=planner.planner_loop, args=(stop_event,), daemon=True)
+    planner_thread.start()
     
     try:
-        await websocket_broadcaster(shared_state, slam_processor, stop_event)
+        await websocket_broadcaster(shared_state, slam_processor, planner, stop_event)
     except KeyboardInterrupt:
         print("\n[Main] Shutting down...")
     finally:

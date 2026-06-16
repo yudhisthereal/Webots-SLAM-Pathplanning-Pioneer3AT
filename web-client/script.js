@@ -41,6 +41,8 @@ let rawRobotY = 0;
 let rawRobotTheta = 0;
 let currentMap = null;
 let slamMatchScore = 0;
+let currentPath = [];
+let manualDriving = false; // when true, keyboard controls are forwarded to robot
 
 // Statistics
 let lastScanTime = 0;
@@ -417,6 +419,9 @@ function renderMapView() {
 
     drawRobotOnMap();
 
+    // Draw planned path if available
+    drawPath(currentPath);
+
     mapCtx.fillStyle = '#1f2937';
     mapCtx.font = '12px Arial';
     mapCtx.fillText(`zoom: ${mapView.zoom.toFixed(0)} px/m`, 12, 18);
@@ -503,6 +508,13 @@ function connectWebSocket() {
                     currentMap = data.map;
                 }
 
+                // Update path if present
+                if (data.path) {
+                    currentPath = data.path.map(p => ({ x: p.x, y: p.y }));
+                } else {
+                    currentPath = [];
+                }
+
                 renderActiveView();
 
                 console.log(`[Update] ${data.pose_source || 'slam'} pose=(${robotX.toFixed(2)}, ${robotY.toFixed(2)}), score=${slamMatchScore.toFixed(3)}`);
@@ -560,39 +572,52 @@ function sendCommand(command) {
 
 function setupKeyboardControls() {
     document.addEventListener('keydown', function(event) {
-        switch (event.key) {
-            case 'ArrowUp':
-                sendCommand('forward');
-                event.preventDefault();
-                break;
-            case 'ArrowDown':
-                sendCommand('backward');
-                event.preventDefault();
-                break;
-            case 'ArrowLeft':
-                sendCommand('left');
-                event.preventDefault();
-                break;
-            case 'ArrowRight':
-                sendCommand('right');
-                event.preventDefault();
-                break;
-            case ' ':
-                sendCommand('stop');
-                event.preventDefault();
-                break;
-            case 'a':
-                sendCommand('auto');
-                event.preventDefault();
-                break;
-            case 'm':
-                showView('map');
-                event.preventDefault();
-                break;
-            case 'r':
-                showView('radar');
-                event.preventDefault();
-                break;
+        // Toggle manual driving off with 'q'
+        if (event.key === 'q' || event.key === 'Q') {
+            if (manualDriving) {
+                manualDriving = false;
+                const btn = document.getElementById('driveManualBtn');
+                if (btn) btn.disabled = false;
+            }
+            return;
+        }
+
+        // Only forward movement commands while manual driving is enabled
+        if (manualDriving) {
+            switch (event.key) {
+                case 'ArrowUp':
+                    sendCommand('forward');
+                    event.preventDefault();
+                    break;
+                case 'ArrowDown':
+                    sendCommand('backward');
+                    event.preventDefault();
+                    break;
+                case 'ArrowLeft':
+                    sendCommand('left');
+                    event.preventDefault();
+                    break;
+                case 'ArrowRight':
+                    sendCommand('right');
+                    event.preventDefault();
+                    break;
+                case ' ':
+                    sendCommand('stop');
+                    event.preventDefault();
+                    break;
+                case 'a':
+                    sendCommand('auto');
+                    event.preventDefault();
+                    break;
+                case 'm':
+                    showView('map');
+                    event.preventDefault();
+                    break;
+                case 'r':
+                    showView('radar');
+                    event.preventDefault();
+                    break;
+            }
         }
     });
 }
@@ -659,6 +684,20 @@ function setupMapInteractions() {
 
         renderMapView();
     }, { passive: false });
+    // Double-click to set a goal
+    mapCanvas.addEventListener('dblclick', function(event) {
+        if (activeView !== 'map') return;
+        const rect = mapCanvas.getBoundingClientRect();
+        const scaleX = mapCanvas.width / rect.width;
+        const scaleY = mapCanvas.height / rect.height;
+        const canvasX = (event.clientX - rect.left) * scaleX;
+        const canvasY = (event.clientY - rect.top) * scaleY;
+        const world = mapScreenToWorld(canvasX, canvasY);
+        console.log('[Map] Goal set at', world.x.toFixed(2), world.y.toFixed(2));
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'set_goal', x: world.x, y: world.y }));
+        }
+    });
 }
 
 window.addEventListener('load', function() {
@@ -690,9 +729,43 @@ window.addEventListener('load', function() {
         connectWebSocket();
     }, 1000);
 
+    // Drive Manually button
+    const driveBtn = document.getElementById('driveManualBtn');
+    if (driveBtn) {
+        driveBtn.addEventListener('click', function() {
+            manualDriving = true;
+            driveBtn.disabled = true;
+            console.log('[Manual] Keyboard control enabled');
+        });
+    }
+
     document.getElementById('wsUrl').addEventListener('keypress', function(event) {
         if (event.key === 'Enter') {
             connectWebSocket();
         }
     });
 });
+
+function drawPath(path) {
+    if (!path || path.length === 0) return;
+    mapCtx.strokeStyle = '#ff8800';
+    mapCtx.lineWidth = 2;
+    mapCtx.beginPath();
+    for (let i = 0; i < path.length; i++) {
+        const p = path[i];
+        const s = worldToMapScreen(p.x, p.y);
+        if (i === 0) mapCtx.moveTo(s.x, s.y);
+        else mapCtx.lineTo(s.x, s.y);
+    }
+    mapCtx.stroke();
+
+    // Draw points
+    for (let i = 0; i < path.length; i++) {
+        const p = path[i];
+        const s = worldToMapScreen(p.x, p.y);
+        mapCtx.fillStyle = '#ff4400';
+        mapCtx.beginPath();
+        mapCtx.arc(s.x, s.y, 4, 0, 2 * Math.PI);
+        mapCtx.fill();
+    }
+}
