@@ -48,7 +48,7 @@ MAX_LOG_ODDS = 3.0
 MIN_LOG_ODDS = -3.0
 OCCUPIED_THRESHOLD = 0.6
 
-LIDAR_OFFSET_X = 0.0   # e.g., 0.10 if LiDAR is 10 cm forward
+LIDAR_OFFSET_X = 0.12   # e.g., 0.10 if LiDAR is 10 cm forward
 LIDAR_OFFSET_Y = 0.0   # e.g., -0.05 if 5 cm to the right (negative = right)
 
 # Sensor parameters
@@ -688,8 +688,11 @@ class SlamProcessor:
         """Get the current occupancy grid"""
         return self.map_grid.get_map()
 
-def coarse_grid_from_map(map_data, coarse_factor=COARSE_FACTOR):
-    """Create a downsampled occupancy grid."""
+def coarse_grid_from_map(map_data, coarse_factor=COARSE_FACTOR, robot_width=ROBOT_WIDTH):
+    """
+    Create a downsampled occupancy grid (coarse) and then inflate obstacles
+    on that coarse grid by a number of coarse cells derived from robot radius.
+    """
     if not map_data:
         return None
 
@@ -698,15 +701,16 @@ def coarse_grid_from_map(map_data, coarse_factor=COARSE_FACTOR):
     res = map_data['resolution']
     data = np.array(map_data['data'], dtype=np.int8).reshape((height, width))
 
+    # 1. Downsample to coarse (original method)
     cf = int(coarse_factor)
     cw = max(1, width // cf)
     ch = max(1, height // cf)
     cres = res * cf
 
-    coarse = np.zeros((ch, cw), dtype=np.int8)
-
+    # Build coarse binary occupancy (1 = occupied, 0 = free)
+    coarse = np.zeros((ch, cw), dtype=np.uint8)   # use uint8 for boolean ops
     for cy in range(ch):
-        for cx in range(cw):
+        for cx in range(ch):
             fx0 = cx * cf
             fy0 = cy * cf
             fx1 = min(width, fx0 + cf)
@@ -714,14 +718,26 @@ def coarse_grid_from_map(map_data, coarse_factor=COARSE_FACTOR):
             block = data[fy0:fy1, fx0:fx1]
             if np.any(block == 100):
                 coarse[cy, cx] = 1
-    
+
+    # 2. Compute inflation radius in coarse cells
+    robot_radius = robot_width / 2.0
+    # Number of coarse cells to inflate (at least 1)
+    inflation_cells = max(1, int(robot_radius / cres))
+
+    # 3. Dilate the coarse occupancy using 8‑connectivity
+    struct = generate_binary_structure(2, 2)   # 8‑neighbour kernel
+    inflated = binary_dilation(coarse, structure=struct, iterations=inflation_cells)
+
+    # Convert back to int8 (0/1) for A* (which expects 0 = free, 1 = occupied)
+    inflated = inflated.astype(np.int8)
+
     return {
         'width': cw,
         'height': ch,
         'resolution': cres,
         'origin_x': -width * res / 2.0,
         'origin_y': -height * res / 2.0,
-        'data': coarse,
+        'data': inflated,   # now 0/1 (occupied inflated)
     }
 
 

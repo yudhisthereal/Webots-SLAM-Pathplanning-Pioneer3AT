@@ -33,7 +33,7 @@ WorldInfo {
 }
 Viewpoint {
   orientation 0.7062230459006614 0.0008001935118925611 -0.7079889611633334 3.1399844700535233
-  position -11.477750088274348 3.0135649734372967 28.459205182382036
+  position -1.1210150952048474 -0.3891681225535915 33.530964222726375
 }
 TexturedBackground {
 }
@@ -44,7 +44,7 @@ RectangleArena {
   floorTileSize 1 1
 }
 Pioneer3dx {
-  translation -12.45 2.7 0.0975
+  translation -3.54 2.70001 0.0975
   rotation 0 0 1 1.5708
   controller "odometry-test-p3dx"
   extensionSlot [
