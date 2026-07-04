@@ -14,10 +14,11 @@ import math
 import time
 import threading
 import heapq
-from typing import Deque
+import queue
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Optional, List, Tuple
+from typing import Optional, Tuple, Any
+from scipy.ndimage import binary_dilation, generate_binary_structure
 
 # ============ Configuration ============
 UDP_PORT = 8765
@@ -26,11 +27,13 @@ BROADCAST_POSE_HZ = 30  # 30 Hz pose updates
 BROADCAST_MAP_HZ = 1    # 1 Hz map updates
 
 # Planner settings
-COARSE_FACTOR = 8  # how many fine cells per coarse cell
+COARSE_FACTOR = 4  # COARSE_FACTOR^2 fine cells per coarse cell
 ROBOT_WIDTH = 0.35  # meters
 
-# UDP port robot listens on for commands/path
-ROBOT_CMD_PORT = 8767
+# UDP ports for robot communication
+ROBOT_DATA_PORT = 8765    # Robot → Bridge (LiDAR/odometry)
+ROBOT_CMD_PORT = 8767     # Bridge → Robot (Commands)
+ROBOT_PATH_PORT = 8768    # Bridge → Robot (Path following)
 
 # Map parameters
 MAP_SIZE = 1880  # pixels
@@ -44,6 +47,9 @@ LOG_ODDS_FREE = -0.4
 MAX_LOG_ODDS = 3.0
 MIN_LOG_ODDS = -3.0
 OCCUPIED_THRESHOLD = 0.6
+
+LIDAR_OFFSET_X = 0.0   # e.g., 0.10 if LiDAR is 10 cm forward
+LIDAR_OFFSET_Y = 0.0   # e.g., -0.05 if 5 cm to the right (negative = right)
 
 # Sensor parameters
 MAX_RANGE = 12.0
@@ -108,6 +114,16 @@ class SlamState:
     scan_matching_skipped: bool = False
 
 
+@dataclass
+class Command:
+    """Command with priority for immediate execution"""
+    priority: int  # Lower = higher priority (0 = emergency)
+    timestamp: float
+    command_type: str  # 'cmd', 'auto', 'path'
+    payload: Any
+    callback: Optional[callable] = None  # Optional acknowledgment callback
+
+
 def wrap_angle(angle):
     """Wrap an angle to [-pi, pi]."""
     while angle > math.pi:
@@ -122,8 +138,10 @@ print("UDP to WebSocket Bridge with Grid Map SLAM")
 print("Clean Architecture - Client Compatible")
 print("=" * 60)
 print(f"Map: {MAP_SIZE}x{MAP_SIZE} cells, {MAP_RESOLUTION*100:.0f}cm resolution")
-print(f"UDP Receive Port: {UDP_PORT}")
+print(f"UDP Receive Port (Robot→Bridge): {ROBOT_DATA_PORT}")
 print(f"WebSocket Port: {WEBSOCKET_PORT}")
+print(f"UDP Command Port (Bridge→Robot): {ROBOT_CMD_PORT}")
+print(f"UDP Path Port (Bridge→Robot): {ROBOT_PATH_PORT}")
 print(f"Pose broadcast: {BROADCAST_POSE_HZ} Hz")
 print(f"Map broadcast: {BROADCAST_MAP_HZ} Hz")
 print(f"Correction Weight: {CORRECTION_WEIGHT * 100:.0f}%")
@@ -134,7 +152,7 @@ print("=" * 60)
 class OccupancyGrid:
     """2D occupancy grid map using log-odds with dynamic expansion"""
 
-    def __init__(self, width, height, resolution):
+    def __init__(self, width, height, resolution, offset_x=0.0, offset_y=0.0):
         self.width = width
         self.height = height
         self.resolution = resolution
@@ -143,6 +161,9 @@ class OccupancyGrid:
         self.log_odds = np.zeros((height, width), dtype=np.float32)
         self.occupancy = np.full((height, width), -1, dtype=np.int8)
         self.last_update_packet_id = -1
+        # LiDAR mounting offset (in robot's local frame)
+        self.lidar_offset_x = offset_x
+        self.lidar_offset_y = offset_y
 
     def world_to_grid(self, x, y):
         """Convert world coordinates to grid indices"""
@@ -179,8 +200,11 @@ class OccupancyGrid:
         v1 = v01 * (1.0 - tx) + v11 * tx
         return v0 * (1.0 - ty) + v1 * ty
 
-    def score_scan_pose(self, robot_x, robot_y, robot_theta, ranges, angles):
-        """Score how well a pose aligns with the current map."""
+    def score_scan_pose(self, lidar_x, lidar_y, robot_theta, ranges, angles):
+        """
+        Score how well a scan aligns with the current map.
+        lidar_x, lidar_y: the world position of the LiDAR origin.
+        """
         score = 0.0
         valid_points = 0
 
@@ -195,12 +219,12 @@ class OccupancyGrid:
             cos_beam = math.cos(beam_angle)
             sin_beam = math.sin(beam_angle)
 
-            quarter_x = robot_x + 0.25 * r * cos_beam
-            quarter_y = robot_y + 0.25 * r * sin_beam
-            mid_x = robot_x + 0.50 * r * cos_beam
-            mid_y = robot_y + 0.50 * r * sin_beam
-            end_x = robot_x + r * cos_beam
-            end_y = robot_y + r * sin_beam
+            quarter_x = lidar_x + 0.25 * r * cos_beam
+            quarter_y = lidar_y + 0.25 * r * sin_beam
+            mid_x = lidar_x + 0.50 * r * cos_beam
+            mid_y = lidar_y + 0.50 * r * sin_beam
+            end_x = lidar_x + r * cos_beam
+            end_y = lidar_y + r * sin_beam
 
             score += 1.8 * self.sample_log_odds(end_x, end_y)
             score -= 0.6 * self.sample_log_odds(mid_x, mid_y)
@@ -213,26 +237,38 @@ class OccupancyGrid:
         return score / valid_points
 
     def refine_pose(self, robot_x, robot_y, robot_theta, ranges, angles):
-        """Refine the supplied pose with a small local scan-matching search."""
+        """
+        Refine the supplied robot-center pose with a small local search.
+        Internally converts to LiDAR world position using the offset.
+        """
         if not self.is_ready_for_scan_matching():
             return robot_x, robot_y, robot_theta, 0.0
 
-        best_pose = (robot_x, robot_y, robot_theta)
-        best_score = self.score_scan_pose(robot_x, robot_y, robot_theta, ranges, angles)
+        # Helper: compute LiDAR position from robot center pose
+        def lidar_from_robot(rx, ry, rt):
+            lx = rx + self.lidar_offset_x * math.cos(rt) - self.lidar_offset_y * math.sin(rt)
+            ly = ry + self.lidar_offset_x * math.sin(rt) + self.lidar_offset_y * math.cos(rt)
+            return lx, ly
 
-        # Translation search
+        # Score the starting pose
+        lx0, ly0 = lidar_from_robot(robot_x, robot_y, robot_theta)
+        best_score = self.score_scan_pose(lx0, ly0, robot_theta, ranges, angles)
+        best_pose = (robot_x, robot_y, robot_theta)
+
+        # Translation search (in robot center space)
         dx_values = np.arange(-SCAN_MATCH_TRANSLATION_RANGE, SCAN_MATCH_TRANSLATION_RANGE + 1e-6, SCAN_MATCH_TRANSLATION_STEP)
         dy_values = np.arange(-SCAN_MATCH_TRANSLATION_RANGE, SCAN_MATCH_TRANSLATION_RANGE + 1e-6, SCAN_MATCH_TRANSLATION_STEP)
 
         for dx in dx_values:
             for dy in dy_values:
-                candidate_x = robot_x + float(dx)
-                candidate_y = robot_y + float(dy)
-                candidate_score = self.score_scan_pose(candidate_x, candidate_y, robot_theta, ranges, angles)
+                cand_x = robot_x + float(dx)
+                cand_y = robot_y + float(dy)
+                lx, ly = lidar_from_robot(cand_x, cand_y, robot_theta)
+                candidate_score = self.score_scan_pose(lx, ly, robot_theta, ranges, angles)
 
                 if candidate_score > best_score:
                     best_score = candidate_score
-                    best_pose = (candidate_x, candidate_y, robot_theta)
+                    best_pose = (cand_x, cand_y, robot_theta)
 
         # Fine search
         if best_pose != (robot_x, robot_y, robot_theta):
@@ -242,13 +278,14 @@ class OccupancyGrid:
 
             for dx in dx_values:
                 for dy in dy_values:
-                    candidate_x = base_x + float(dx)
-                    candidate_y = base_y + float(dy)
-                    candidate_score = self.score_scan_pose(candidate_x, candidate_y, robot_theta, ranges, angles)
+                    cand_x = base_x + float(dx)
+                    cand_y = base_y + float(dy)
+                    lx, ly = lidar_from_robot(cand_x, cand_y, robot_theta)
+                    candidate_score = self.score_scan_pose(lx, ly, robot_theta, ranges, angles)
 
                     if candidate_score > best_score:
                         best_score = candidate_score
-                        best_pose = (candidate_x, candidate_y, robot_theta)
+                        best_pose = (cand_x, cand_y, robot_theta)
 
         return best_pose[0], best_pose[1], best_pose[2], best_score
 
@@ -269,8 +306,11 @@ class OccupancyGrid:
                     self.log_odds[ny, nx] += LOG_ODDS_OCCUPIED * 0.75
                     self.log_odds[ny, nx] = np.clip(self.log_odds[ny, nx], MIN_LOG_ODDS, MAX_LOG_ODDS)
 
-    def update(self, robot_x, robot_y, robot_theta, ranges, angles, packet_id):
-        """Update occupancy grid with new LiDAR scan"""
+    def update(self, lidar_x, lidar_y, robot_theta, ranges, angles, packet_id):
+        """
+        Update occupancy grid with new LiDAR scan.
+        lidar_x, lidar_y: world position of the LiDAR origin.
+        """
         if packet_id <= self.last_update_packet_id:
             return False
         
@@ -283,8 +323,8 @@ class OccupancyGrid:
             if r < MIN_RANGE or r > MAX_RANGE:
                 continue
 
-            end_x = robot_x + r * math.cos(robot_theta + angle)
-            end_y = robot_y + r * math.sin(robot_theta + angle)
+            end_x = lidar_x + r * math.cos(robot_theta + angle)
+            end_y = lidar_y + r * math.sin(robot_theta + angle)
 
             gx, gy = self.world_to_grid(end_x, end_y)
             self.mark_occupied_with_neighbors(gx, gy)
@@ -292,8 +332,8 @@ class OccupancyGrid:
             steps = int(r / self.resolution)
             for step in range(steps):
                 t = step * self.resolution / r
-                ray_x = robot_x + r * t * math.cos(robot_theta + angle)
-                ray_y = robot_y + r * t * math.sin(robot_theta + angle)
+                ray_x = lidar_x + r * t * math.cos(robot_theta + angle)
+                ray_y = lidar_y + r * t * math.sin(robot_theta + angle)
 
                 gx, gy = self.world_to_grid(ray_x, ray_y)
                 if 0 <= gx < self.width and 0 <= gy < self.height:
@@ -316,6 +356,178 @@ class OccupancyGrid:
             "resolution": self.resolution,
             "data": self.occupancy.flatten().tolist()
         }
+
+class DedicatedCommandForwarder:
+    """
+    Dedicated command forwarder with separate ports for commands and paths.
+    Uses non-blocking UDP sockets for immediate transmission.
+    """
+    
+    def __init__(self, cmd_port=ROBOT_CMD_PORT, path_port=ROBOT_PATH_PORT):
+        self.cmd_port = cmd_port
+        self.path_port = path_port
+        self.command_queue = queue.PriorityQueue()
+        self.path_queue = queue.PriorityQueue()
+        self.stop_event = threading.Event()
+        self._cmd_thread = None
+        self._path_thread = None
+        self._cmd_socket = None
+        self._path_socket = None
+        self._lock = threading.Lock()
+        
+    def start(self):
+        """Start the command forwarder threads"""
+        if self._cmd_thread is not None and self._cmd_thread.is_alive():
+            return
+            
+        self.stop_event.clear()
+        
+        # Create dedicated UDP sockets for each channel
+        self._cmd_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._cmd_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._cmd_socket.setblocking(False)
+        
+        self._path_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._path_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._path_socket.setblocking(False)
+        
+        # Start separate threads for commands and paths
+        self._cmd_thread = threading.Thread(target=self._cmd_forward_loop, daemon=True)
+        self._cmd_thread.start()
+        
+        self._path_thread = threading.Thread(target=self._path_forward_loop, daemon=True)
+        self._path_thread.start()
+        
+        print(f"[CommandForwarder] Started - CMD port: {self.cmd_port}, PATH port: {self.path_port}")
+        
+    def stop(self):
+        """Stop the command forwarder"""
+        self.stop_event.set()
+        if self._cmd_thread is not None:
+            self._cmd_thread.join(timeout=1.0)
+        if self._path_thread is not None:
+            self._path_thread.join(timeout=1.0)
+        if self._cmd_socket:
+            self._cmd_socket.close()
+            self._cmd_socket = None
+        if self._path_socket:
+            self._path_socket.close()
+            self._path_socket = None
+        print("[CommandForwarder] Stopped")
+        
+    def send_command(self, command_type: str, payload: Any, priority: int = 10, callback: Optional[callable] = None):
+        """
+        Send a command to the robot immediately.
+        
+        Args:
+            command_type: 'cmd', 'auto', 'path'
+            payload: Command payload (string for 'cmd'/'auto', list for 'path')
+            priority: Lower = higher priority (0 = emergency stop)
+            callback: Optional callback for acknowledgment
+        """
+        cmd = Command(
+            priority=priority,
+            timestamp=time.time(),
+            command_type=command_type,
+            payload=payload,
+            callback=callback
+        )
+        
+        # Route to appropriate queue
+        if command_type == 'path':
+            self.path_queue.put((priority, time.time(), cmd))
+            print(f"[CommandForwarder] Queued PATH with priority {priority} on PORT {self.path_port}")
+        else:
+            self.command_queue.put((priority, time.time(), cmd))
+            print(f"[CommandForwarder] Queued {command_type} with priority {priority} on PORT {self.cmd_port}")
+        
+    def _cmd_forward_loop(self):
+        """Forward commands on dedicated command port"""
+        print(f"[CommandForwarder] CMD thread started on port {self.cmd_port}")
+        
+        while not self.stop_event.is_set():
+            try:
+                try:
+                    _, _, cmd = self.command_queue.get(timeout=0.01)
+                except queue.Empty:
+                    continue
+                
+                if cmd.command_type == 'cmd':
+                    message = f"CMD:{cmd.payload}".encode('utf-8')
+                    self._send_udp(self._cmd_socket, message, self.cmd_port)
+                elif cmd.command_type == 'auto':
+                    value = "1" if cmd.payload else "0"
+                    message = f"AUTO:{value}".encode('utf-8')
+                    self._send_udp(self._cmd_socket, message, self.cmd_port)
+                else:
+                    print(f"[CommandForwarder] Unknown command type in CMD queue: {cmd.command_type}")
+                    
+                if cmd.callback:
+                    try:
+                        cmd.callback(True)
+                    except Exception as e:
+                        print(f"[CommandForwarder] Callback error: {e}")
+                        
+            except Exception as e:
+                print(f"[CommandForwarder] CMD thread error: {e}")
+                
+        print("[CommandForwarder] CMD thread stopped")
+        
+    def _path_forward_loop(self):
+        """Forward path commands on dedicated path port"""
+        print(f"[CommandForwarder] PATH thread started on port {self.path_port}")
+        
+        while not self.stop_event.is_set():
+            try:
+                try:
+                    _, _, cmd = self.path_queue.get(timeout=0.01)
+                except queue.Empty:
+                    continue
+                
+                if cmd.command_type == 'path':
+                    if isinstance(cmd.payload, list) and cmd.payload:
+                        path_str = ';'.join([f"{p[0]:.3f},{p[1]:.3f}" for p in cmd.payload])
+                        message = f"PATH:{path_str}".encode('utf-8')
+                        self._send_udp(self._path_socket, message, self.path_port)
+                        print(f"[CommandForwarder] Sent PATH with {len(cmd.payload)} points on port {self.path_port}")
+                    else:
+                        print(f"[CommandForwarder] Invalid path payload: {cmd.payload}")
+                else:
+                    print(f"[CommandForwarder] Unknown command type in PATH queue: {cmd.command_type}")
+                    
+                if cmd.callback:
+                    try:
+                        cmd.callback(True)
+                    except Exception as e:
+                        print(f"[CommandForwarder] Callback error: {e}")
+                        
+            except Exception as e:
+                print(f"[CommandForwarder] PATH thread error: {e}")
+                
+        print("[CommandForwarder] PATH thread stopped")
+        
+    def _send_udp(self, sock, message: bytes, port: int):
+        """Send UDP message to robot (non-blocking)"""
+        if not sock:
+            print(f"[CommandForwarder] No UDP socket available for port {port}")
+            return
+            
+        try:
+            # Send to localhost on the specified port
+            sock.sendto(message, ('127.0.0.1', port))
+            # print(f"[CommandForwarder] Sent to port {port}: {message[:50]}...")
+        except BlockingIOError:
+            # Socket would block - this shouldn't happen with small messages
+            print(f"[CommandForwarder] Socket would block on port {port}, retrying...")
+            # Try one more time in blocking mode
+            try:
+                sock.setblocking(True)
+                sock.sendto(message, ('127.0.0.1', port))
+                sock.setblocking(False)
+            except Exception as e:
+                print(f"[CommandForwarder] Retry failed on port {port}: {e}")
+        except Exception as e:
+            print(f"[CommandForwarder] UDP send error on port {port}: {e}")
 
 
 class AtomicSharedPacket:
@@ -361,7 +573,11 @@ class SlamProcessor:
     def __init__(self, shared_packet: AtomicSharedPacket, shared_state: AtomicSharedState):
         self.shared_packet = shared_packet
         self.shared_state = shared_state
-        self.map_grid = OccupancyGrid(MAP_SIZE, MAP_SIZE, MAP_RESOLUTION)
+        self.map_grid = OccupancyGrid(
+            MAP_SIZE, MAP_SIZE, MAP_RESOLUTION,
+            offset_x=LIDAR_OFFSET_X,
+            offset_y=LIDAR_OFFSET_Y
+        )
         
         self.last_generation = 0
         
@@ -433,10 +649,16 @@ class SlamProcessor:
             self.slam_y = current_y
             self.slam_theta = current_theta
         
+        # --- LiDAR offset correction: compute LiDAR world position ---
+        lidar_x = self.slam_x + LIDAR_OFFSET_X * math.cos(self.slam_theta) - LIDAR_OFFSET_Y * math.sin(self.slam_theta)
+        lidar_y = self.slam_y + LIDAR_OFFSET_X * math.sin(self.slam_theta) + LIDAR_OFFSET_Y * math.cos(self.slam_theta)
+        
         map_updated = False
         if not is_rotating_fast:
-            map_updated = self.map_grid.update(self.slam_x, self.slam_y, self.slam_theta, 
-                                               packet.ranges, packet.angles, packet.packet_id)
+            map_updated = self.map_grid.update(
+                lidar_x, lidar_y, self.slam_theta,
+                packet.ranges, packet.angles, packet.packet_id
+            )
         
         self.state_id += 1
         new_state = SlamState(
@@ -466,7 +688,6 @@ class SlamProcessor:
         """Get the current occupancy grid"""
         return self.map_grid.get_map()
 
-
 def coarse_grid_from_map(map_data, coarse_factor=COARSE_FACTOR):
     """Create a downsampled occupancy grid."""
     if not map_data:
@@ -493,6 +714,7 @@ def coarse_grid_from_map(map_data, coarse_factor=COARSE_FACTOR):
             block = data[fy0:fy1, fx0:fx1]
             if np.any(block == 100):
                 coarse[cy, cx] = 1
+    
     return {
         'width': cw,
         'height': ch,
@@ -501,6 +723,7 @@ def coarse_grid_from_map(map_data, coarse_factor=COARSE_FACTOR):
         'origin_y': -height * res / 2.0,
         'data': coarse,
     }
+
 
 def astar_plan(coarse, start_xy, goal_xy):
     """A* on coarse grid. Returns list of world points (x,y)."""
@@ -585,7 +808,7 @@ def astar_plan(coarse, start_xy, goal_xy):
 
     path = [to_world(px, py) for (px, py) in path_idx]
 
-    # Simplify path
+    # Simplify path using Bresenham's line
     simplified = []
     def bresenham_clear(a, b):
         ax, ay = a
@@ -624,22 +847,23 @@ def astar_plan(coarse, start_xy, goal_xy):
             prev = p
         if simplified[-1] != path[-1]:
             simplified.append(path[-1])
-        # Remove first point (robot position)
-        if simplified and len(simplified) > 0:
+        # Remove first point (robot position) to avoid immediate stopping
+        if simplified and len(simplified) > 1:
             simplified = simplified[1:]
 
     return simplified
 
 
 class PlannerWorker:
-    def __init__(self, slam_processor, shared_state):
+    def __init__(self, slam_processor, shared_state, command_forwarder):
         self.slam_processor = slam_processor
         self.shared_state = shared_state
-        self._goal = None  # Private variable for goal
+        self.command_forwarder = command_forwarder
+        self._goal = None
         self.path = []
         self.start_at_goal = None
         self.lock = threading.Lock()
-        self.request_queue = deque()  # <-- Use deque() directly
+        self.request_queue = deque()
 
     def get_goal(self):
         """Get the current goal"""
@@ -682,27 +906,35 @@ class PlannerWorker:
 
             # Get map and plan path
             map_data = self.slam_processor.get_map()
-            coarse = coarse_grid_from_map(map_data)  # Just downsample, no inflation
+            coarse = coarse_grid_from_map(map_data)
             planned = astar_plan(coarse, (sx, sy), goal)
 
             with self.lock:
-                self._goal = goal  # Keep the goal
+                self._goal = goal
                 self.path = planned
-
+            
+            # Send path to robot IMMEDIATELY via dedicated path forwarder
+            if planned:
+                robot_path = [(x, -y) for x, y in planned]
+                self.command_forwarder.send_command('path', robot_path, priority=5)
+                print(f"[Planner] Sending path with {len(planned)} points to robot on port {ROBOT_PATH_PORT}")
+            else:
+                print(f"[Planner] No path found to goal ({goal[0]:.2f},{goal[1]:.2f})")
+                
             print(f"[Planner] Planned path with {len(planned)} points to ({goal[0]:.2f},{goal[1]:.2f})")
             time.sleep(0.05)
 
 
 def udp_receiver(shared_packet: AtomicSharedPacket, stop_event: threading.Event):
-    """UDP receiver thread - only receives packets and updates shared state"""
+    """UDP receiver thread - receives data from robot on port 8765"""
     udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    udp_socket.bind(('0.0.0.0', UDP_PORT))
+    udp_socket.bind(('0.0.0.0', ROBOT_DATA_PORT))
     udp_socket.settimeout(0.1)
     
     packet_count = 0
     packet_id = 0
-    print(f"[Receiver] UDP thread started on port {UDP_PORT}")
+    print(f"[Receiver] UDP thread started on port {ROBOT_DATA_PORT} (Robot→Bridge)")
     
     while not stop_event.is_set():
         try:
@@ -710,13 +942,10 @@ def udp_receiver(shared_packet: AtomicSharedPacket, stop_event: threading.Event)
             
             try:
                 message = data.decode('utf-8')
-                # print(f"[DEBUG] Raw UDP received (first 100 chars): {message[:100]}...")
-                
                 scan_data = json.loads(message)
                 
                 if scan_data.get('type') == 'lidar_scan':
                     packet_id += 1
-                    # print(f"[DEBUG] LiDAR scan received, auto_navigate={scan_data.get('auto_navigate', 'unknown')}")
                     
                     ranges = tuple(scan_data.get('ranges', []))
                     angles = tuple(scan_data.get('angles', []))
@@ -743,7 +972,7 @@ def udp_receiver(shared_packet: AtomicSharedPacket, stop_event: threading.Event)
                         print(f"[Receiver] {packet_count} packets received, last packet_id: {packet_id}")
                         
             except json.JSONDecodeError as e:
-                print(f"[DEBUG] JSON decode error: {e}, raw message: {message[:200]}...")
+                print(f"[DEBUG] JSON decode error: {e}")
             except Exception as e:
                 print(f"[DEBUG] Error processing packet: {e}")
                 
@@ -755,14 +984,17 @@ def udp_receiver(shared_packet: AtomicSharedPacket, stop_event: threading.Event)
     udp_socket.close()
     print(f"[Receiver] Stopped. Total packets: {packet_count}, last packet_id: {packet_id}")
 
-async def websocket_broadcaster(shared_state: AtomicSharedState, slam_processor: SlamProcessor, planner: PlannerWorker, stop_event: threading.Event):
+
+async def websocket_broadcaster(shared_state: AtomicSharedState, slam_processor: SlamProcessor, 
+                                 planner: PlannerWorker, command_forwarder: DedicatedCommandForwarder,
+                                 stop_event: threading.Event):
     """WebSocket broadcaster - sends pose at fixed rate, map at lower rate"""
     
     connected_clients = set()
     
-    # UDP socket for sending commands/paths to robot
-    udp_cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    udp_cmd_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # UDP socket for sending path updates (for backwards compatibility)
+    udp_backup_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_backup_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     
     async def handle_client(websocket):
         print(f"[Broadcaster] Client connected from {websocket.remote_address}")
@@ -776,17 +1008,23 @@ async def websocket_broadcaster(shared_state: AtomicSharedState, slam_processor:
                         cmd = data.get('command')
                         print(f"[Command] Received: {cmd}")
                         
-                        # Forward all commands to robot via UDP
-                        try:
-                            if cmd == 'auto':
-                                # Toggle auto mode - send both CMD and AUTO to ensure robot catches it
-                                udp_cmd_sock.sendto(f"CMD:auto".encode('utf-8'), ('127.0.0.1', ROBOT_CMD_PORT))
-                                # Also send explicit AUTO toggle
-                                # We'll let the robot handle the toggle via CMD:auto
-                            else:
-                                udp_cmd_sock.sendto(f"CMD:{cmd}".encode('utf-8'), ('127.0.0.1', ROBOT_CMD_PORT))
-                        except Exception as e:
-                            print(f"[Broadcaster] UDP cmd send error: {e}")
+                        # Send command IMMEDIATELY via dedicated command forwarder
+                        if cmd == 'forward':
+                            command_forwarder.send_command('cmd', 'forward', priority=3)
+                        elif cmd == 'backward':
+                            command_forwarder.send_command('cmd', 'backward', priority=3)
+                        elif cmd == 'left':
+                            command_forwarder.send_command('cmd', 'left', priority=3)
+                        elif cmd == 'right':
+                            command_forwarder.send_command('cmd', 'right', priority=3)
+                        elif cmd == 'stop':
+                            command_forwarder.send_command('cmd', 'stop', priority=1)  # High priority
+                        elif cmd == 'auto':
+                            # Toggle auto mode
+                            command_forwarder.send_command('cmd', 'auto', priority=2)
+                        else:
+                            # Unknown command - forward as-is
+                            command_forwarder.send_command('cmd', cmd, priority=10)
 
                     elif data.get('type') == 'set_goal':
                         gx = float(data.get('x', 0.0))
@@ -797,16 +1035,11 @@ async def websocket_broadcaster(shared_state: AtomicSharedState, slam_processor:
                     elif data.get('type') == 'autonomy':
                         auto = bool(data.get('auto_navigate', True))
                         print(f"[Broadcaster] Autonomy set: {auto}")
-                        try:
-                            # Send both the command and the explicit autonomy message
-                            if auto:
-                                udp_cmd_sock.sendto(f"AUTO:1".encode('utf-8'), ('127.0.0.1', ROBOT_CMD_PORT))
-                            else:
-                                udp_cmd_sock.sendto(f"AUTO:0".encode('utf-8'), ('127.0.0.1', ROBOT_CMD_PORT))
-                                # Also send a stop command when disabling auto
-                                udp_cmd_sock.sendto(f"CMD:stop".encode('utf-8'), ('127.0.0.1', ROBOT_CMD_PORT))
-                        except Exception as e:
-                            print(f"[Broadcaster] UDP auto send error: {e}")
+                        # Send AUTO command IMMEDIATELY
+                        command_forwarder.send_command('auto', auto, priority=2)
+                        # Also send stop command when disabling auto
+                        if not auto:
+                            command_forwarder.send_command('cmd', 'stop', priority=1)
                             
                 except json.JSONDecodeError as e:
                     print(f"[Broadcaster] JSON parse error: {e}")
@@ -871,7 +1104,7 @@ async def websocket_broadcaster(shared_state: AtomicSharedState, slam_processor:
                         "pose_source": "slam",
                         "left_speed": slam_state.left_speed,
                         "right_speed": slam_state.right_speed,
-                        "auto_navigate": slam_state.auto_navigate,  # Pass through the robot's auto state
+                        "auto_navigate": slam_state.auto_navigate,
                         "linear_vel": slam_state.linear_vel,
                         "angular_vel": slam_state.angular_vel,
                         "slam_match_score": slam_state.match_score,
@@ -882,7 +1115,7 @@ async def websocket_broadcaster(shared_state: AtomicSharedState, slam_processor:
                     if now - last_map_broadcast >= map_interval:
                         output_message["map"] = slam_processor.get_map()
                         if coarse_grid:
-                            output_message["coarse_grid"] = coarse_grid  # Downsampled grid for A*
+                            output_message["coarse_grid"] = coarse_grid
                         last_map_broadcast = now
 
                     current_path = planner.get_path() if planner is not None else []
@@ -892,16 +1125,17 @@ async def websocket_broadcaster(shared_state: AtomicSharedState, slam_processor:
                     if planner.get_goal():
                         output_message["goal"] = {"x": planner.get_goal()[0], "y": planner.get_goal()[1]}
 
+                    # Backup path send via UDP (for backwards compatibility)
                     if current_path:
                         sig = tuple((round(p[0],3), round(p[1],3)) for p in current_path)
                         if sig != last_sent_path_sig:
                             last_sent_path_sig = sig
+                            # This is a backup - the command forwarder already sent the path
                             try:
                                 path_payload = 'PATH:' + ';'.join([f"{p[0]:.3f},{p[1]:.3f}" for p in current_path])
-                                udp_cmd_sock.sendto(path_payload.encode('utf-8'), ('127.0.0.1', ROBOT_CMD_PORT))
-                                print(f"[Broadcaster] Sent PATH with {len(current_path)} points to robot")
+                                udp_backup_sock.sendto(path_payload.encode('utf-8'), ('127.0.0.1', ROBOT_CMD_PORT))
                             except Exception as e:
-                                print(f"[Broadcaster] UDP path send error: {e}")
+                                print(f"[Broadcaster] UDP backup send error: {e}")
                     
                     payload = json.dumps(output_message)
                     await asyncio.gather(*[client.send(payload) for client in connected_clients], return_exceptions=True)
@@ -911,7 +1145,7 @@ async def websocket_broadcaster(shared_state: AtomicSharedState, slam_processor:
             
             await asyncio.sleep(0.001)
         
-        udp_cmd_sock.close()
+        udp_backup_sock.close()
         print("[Broadcaster] Stopped")
 
 
@@ -919,6 +1153,13 @@ async def main():
     shared_packet = AtomicSharedPacket()
     shared_state = AtomicSharedState()
     stop_event = threading.Event()
+    
+    # Create command forwarder with dedicated ports
+    command_forwarder = DedicatedCommandForwarder(
+        cmd_port=ROBOT_CMD_PORT,
+        path_port=ROBOT_PATH_PORT
+    )
+    command_forwarder.start()
     
     slam_processor = SlamProcessor(shared_packet, shared_state)
     
@@ -928,18 +1169,20 @@ async def main():
     slam_thread = threading.Thread(target=slam_processor.process_loop, args=(stop_event,), daemon=True)
     slam_thread.start()
 
-    planner = PlannerWorker(slam_processor, shared_state)
+    planner = PlannerWorker(slam_processor, shared_state, command_forwarder)
     planner_thread = threading.Thread(target=planner.planner_loop, args=(stop_event,), daemon=True)
     planner_thread.start()
     
     try:
-        await websocket_broadcaster(shared_state, slam_processor, planner, stop_event)
+        await websocket_broadcaster(shared_state, slam_processor, planner, command_forwarder, stop_event)
     except KeyboardInterrupt:
         print("\n[Main] Shutting down...")
     finally:
         stop_event.set()
+        command_forwarder.stop()
         udp_thread.join(timeout=2)
         slam_thread.join(timeout=2)
+        planner_thread.join(timeout=1)
         print("[Main] Shutdown complete")
 
 
