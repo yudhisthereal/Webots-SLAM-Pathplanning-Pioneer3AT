@@ -1,23 +1,25 @@
-// WebSocket connection
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  STATE
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 let ws = null;
-
-// View state
 let activeView = 'radar';
+let currentMode = 'idle'; // 'idle' | 'manual' | 'auto'
 
-// Canvas references
+// Canvas refs
 let radarCanvas = null;
 let radarCtx = null;
 let mapCanvas = null;
 let mapCtx = null;
 
-// Radar view state
+// Radar
 let radarWidth = 0;
 let radarHeight = 0;
 let radarCenterX = 0;
 let radarCenterY = 0;
 let radarScale = 96;
 
-// Map view state
+// Map
 const mapView = {
     zoom: 45,
     centerX: 0,
@@ -29,7 +31,7 @@ const mapView = {
     dragOriginY: 0,
 };
 
-// Data storage
+// Data
 let currentRanges = [];
 let currentAngles = [];
 let maxRange = 12.0;
@@ -42,25 +44,23 @@ let rawRobotTheta = 0;
 let currentMap = null;
 let slamMatchScore = 0;
 let currentPath = [];
-let manualDriving = false; // when true, keyboard controls are forwarded to robot
-let showGridMap = true; // toggle for grid map visibility
-let currentCoarseGrid = null;  // Downsampled grid for A* planning
+let currentGoal = null;
+let currentCoarseGrid = null;
+let showGridMap = true;
 
-// Statistics
+// Stats
 let lastScanTime = 0;
 let scanCount = 0;
 let scanRate = 0;
 let reconnectAttempts = 0;
 const maxReconnectAttempts = 5;
 
-// Axis range for map display (dynamic)
-let mapAxisRange = 10; // meters
+// ── helpers ──
+function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
 
-console.log('[App] Script loaded and ready');
-
-function clamp(value, minimum, maximum) {
-    return Math.max(minimum, Math.min(maximum, value));
-}
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  INIT
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 function initCanvases() {
     radarCanvas = document.getElementById('radarCanvas');
@@ -81,66 +81,53 @@ function getDisplayRange() {
 
 function updateZoomDisplay() {
     const displayRange = getDisplayRange();
-    const zoomLabel = document.getElementById('zoomRange');
-    if (zoomLabel) {
-        zoomLabel.innerHTML = displayRange.toFixed(1) + ' m';
-    }
+    const label = document.getElementById('zoomRange');
+    if (label) label.innerHTML = displayRange.toFixed(1) + ' m';
 }
 
 function setRadarZoom(zoomScale) {
     radarScale = zoomScale;
     document.getElementById('zoomSlider').value = radarScale;
     updateZoomDisplay();
-
-    if (activeView === 'radar') {
-        renderRadarView();
-    }
+    if (activeView === 'radar') renderRadarView();
 }
 
 function initZoomSlider() {
     const slider = document.getElementById('zoomSlider');
-    slider.addEventListener('input', function(event) {
-        setRadarZoom(parseFloat(event.target.value));
-    });
+    slider.addEventListener('input', (e) => setRadarZoom(parseFloat(e.target.value)));
 
     const mapSlider = document.getElementById('mapZoomSlider');
     if (mapSlider) {
-        mapSlider.addEventListener('input', function(event) {
-            const zoomValue = parseFloat(event.target.value);
-            mapView.zoom = zoomValue;
-            document.getElementById('mapZoomValue').textContent = zoomValue.toFixed(0);
-            if (activeView === 'map') {
-                renderMapView();
-            }
+        mapSlider.addEventListener('input', (e) => {
+            const v = parseFloat(e.target.value);
+            mapView.zoom = v;
+            document.getElementById('mapZoomValue').textContent = v.toFixed(0);
+            if (activeView === 'map') renderMapView();
         });
     }
 }
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  VIEWS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 function showView(viewName) {
     activeView = viewName;
-
     document.getElementById('radarTab').classList.toggle('active', viewName === 'radar');
     document.getElementById('mapTab').classList.toggle('active', viewName === 'map');
     document.getElementById('radarPanel').classList.toggle('active', viewName === 'radar');
     document.getElementById('mapPanel').classList.toggle('active', viewName === 'map');
-
-    if (viewName === 'map') {
-        renderMapView();
-    } else {
-        renderRadarView();
-    }
+    if (viewName === 'map') renderMapView();
+    else renderRadarView();
 }
 
+// ── radar ──
 function worldToRadarScreen(range, angle) {
-    // For radar view, the robot is always at center facing up
-    // Range is in meters, convert to pixels
     const forward = range * Math.cos(angle);
     const left = range * Math.sin(angle);
-    
-    // Radar view: Y is up (forward), X is right
     return {
         x: radarCenterX + left * radarScale,
-        y: radarCenterY - forward * radarScale,  // Negative because screen Y goes down
+        y: radarCenterY - forward * radarScale,
     };
 }
 
@@ -158,14 +145,10 @@ function renderRadarBackground() {
 
     for (let radiusMeters = step; radiusMeters <= maxCircle; radiusMeters += step) {
         const radiusPx = radiusMeters * radarScale;
-        if (radiusPx > Math.min(radarWidth, radarHeight) / 2) {
-            break;
-        }
-
+        if (radiusPx > Math.min(radarWidth, radarHeight) / 2) break;
         radarCtx.beginPath();
         radarCtx.arc(radarCenterX, radarCenterY, radiusPx, 0, 2 * Math.PI);
         radarCtx.stroke();
-
         radarCtx.fillStyle = '#666';
         radarCtx.font = '10px Arial';
         radarCtx.fillText(radiusMeters.toFixed(1) + 'm', radarCenterX + radiusPx + 3, radarCenterY - 3);
@@ -207,37 +190,21 @@ function drawRadarRobot() {
 }
 
 function drawRadarPoints(ranges, angles) {
-    if (!ranges || !angles) {
-        return;
-    }
-
+    if (!ranges || !angles) return;
     const displayRange = getDisplayRange();
-    let pointsDrawn = 0;
-
     for (let i = 0; i < ranges.length; i++) {
         const range = ranges[i];
         const angle = angles[i];
-
-        if (range >= maxRange || range <= 0.1 || range > displayRange) {
-            continue;
-        }
-
+        if (range >= maxRange || range <= 0.1 || range > displayRange) continue;
         const screen = worldToRadarScreen(range, angle);
-
         if (screen.x >= 0 && screen.x < radarWidth && screen.y >= 0 && screen.y < radarHeight) {
             const t = Math.min(1, range / maxRange);
             const red = 255;
             const green = Math.floor(255 * t);
             const blue = Math.floor(100 * (1 - t));
-
-            radarCtx.fillStyle = `rgb(${red}, ${green}, ${blue})`;
+            radarCtx.fillStyle = `rgb(${red},${green},${blue})`;
             radarCtx.fillRect(screen.x - 1.5, screen.y - 1.5, 3, 3);
-            pointsDrawn++;
         }
-    }
-
-    if (pointsDrawn > 0 && scanCount % 30 === 0) {
-        console.log(`[Radar] Drew ${pointsDrawn} points`);
     }
 }
 
@@ -247,6 +214,7 @@ function renderRadarView() {
     drawRadarRobot();
 }
 
+// ── map ──
 function worldToMapScreen(worldX, worldY) {
     return {
         x: mapCanvas.width / 2 + (worldX - mapView.centerX) * mapView.zoom,
@@ -265,51 +233,31 @@ function resetMapView() {
     mapView.zoom = 45;
     mapView.centerX = 0;
     mapView.centerY = 0;
-    if (activeView === 'map') {
-        renderMapView();
-    }
+    if (activeView === 'map') renderMapView();
 }
 
 function centerMapOnRobot() {
     mapView.centerX = robotX;
     mapView.centerY = robotY;
-    if (activeView === 'map') {
-        renderMapView();
-    }
-}
-
-function zoomMap(factor) {
-    mapView.zoom = clamp(mapView.zoom * factor, 10, 180);
-    if (activeView === 'map') {
-        renderMapView();
-    }
+    if (activeView === 'map') renderMapView();
 }
 
 function toggleGridMap() {
     showGridMap = !showGridMap;
-    const btn = document.getElementById('toggleGridBtn');
-    btn.textContent = showGridMap ? 'Hide Grid' : 'Show Grid';
-    if (activeView === 'map') {
-        renderMapView();
-    }
-    console.log('[DEBUG] Coarse grid visibility toggled to:', showGridMap);
+    document.getElementById('toggleGridBtn').textContent = showGridMap ? 'Hide Grid' : 'Show Grid';
+    if (activeView === 'map') renderMapView();
 }
 
 function drawCoarseGrid(coarseGridData) {
-    if (!coarseGridData || !coarseGridData.data || !showGridMap) {
-        return;
-    }
-
+    if (!coarseGridData || !coarseGridData.data || !showGridMap) return;
     const mapWidth = coarseGridData.width;
     const mapHeight = coarseGridData.height;
     const resolution = coarseGridData.resolution;
     const originX = coarseGridData.origin_x || -mapWidth * resolution / 2;
     const originY = coarseGridData.origin_y || -mapHeight * resolution / 2;
     const cellSize = resolution * mapView.zoom;
-
-    // Skip if cells are too small for performance
     const step = cellSize < 1.0 ? 2 : 1;
-    
+
     const visibleWorldWidth = mapCanvas.width / mapView.zoom;
     const visibleWorldHeight = mapCanvas.height / mapView.zoom;
     const leftWorld = mapView.centerX - visibleWorldWidth / 2 - resolution * step;
@@ -325,20 +273,14 @@ function drawCoarseGrid(coarseGridData) {
     for (let gy = gyStart; gy <= gyEnd; gy += step) {
         for (let gx = gxStart; gx <= gxEnd; gx += step) {
             const value = coarseGridData.data[gy * mapWidth + gx];
-            if (value !== 1) continue;  // Only draw occupied cells
-
+            if (value !== 1) continue;
             const worldX = originX + gx * resolution;
             const worldY = originY + gy * resolution;
             const screen = worldToMapScreen(worldX, worldY);
             const size = cellSize * step;
-
-            if (screen.x + size < 0 || screen.x > mapCanvas.width || 
-                screen.y + size < 0 || screen.y > mapCanvas.height) {
-                continue;
-            }
-
-            // Draw coarse grid cells with a distinctive transparent color
-            mapCtx.fillStyle = 'rgba(255, 200, 0, 0.3)';  // Yellow-orange with transparency
+            if (screen.x + size < 0 || screen.x > mapCanvas.width ||
+                screen.y + size < 0 || screen.y > mapCanvas.height) continue;
+            mapCtx.fillStyle = 'rgba(255, 200, 0, 0.3)';
             mapCtx.strokeStyle = 'rgba(255, 200, 0, 0.5)';
             mapCtx.lineWidth = 0.5;
             mapCtx.fillRect(screen.x, screen.y, size, size);
@@ -350,164 +292,130 @@ function drawCoarseGrid(coarseGridData) {
 function drawMapAxes() {
     const canvasWidth = mapCanvas.width;
     const canvasHeight = mapCanvas.height;
-    
-    // Determine the visible world range
     const visibleWorldWidth = canvasWidth / mapView.zoom;
     const visibleWorldHeight = canvasHeight / mapView.zoom;
     const leftWorld = mapView.centerX - visibleWorldWidth / 2;
     const rightWorld = mapView.centerX + visibleWorldWidth / 2;
     const bottomWorld = mapView.centerY - visibleWorldHeight / 2;
     const topWorld = mapView.centerY + visibleWorldHeight / 2;
-    
-    // Find a nice step size for axis labels
+
     let range = Math.max(visibleWorldWidth, visibleWorldHeight);
     let step = Math.pow(10, Math.floor(Math.log10(range / 5)));
     if (range / step < 4) step /= 2;
     if (range / step < 2) step /= 2;
-    
-    // ============ DRAW AXIS LINES ============
-    mapCtx.strokeStyle = 'rgba(100, 100, 150, 0.4)';
-    mapCtx.lineWidth = 1.5;
-    
-    // Check if origin is visible and draw axes
+
     const originScreen = worldToMapScreen(0, 0);
     const originVisible = (leftWorld <= 0 && rightWorld >= 0 && bottomWorld <= 0 && topWorld >= 0);
-    
-    // Draw Y-axis (vertical line at x=0)
+
+    // axes lines
+    mapCtx.strokeStyle = 'rgba(100,100,150,0.4)';
+    mapCtx.lineWidth = 1.5;
+
     if (leftWorld <= 0 && rightWorld >= 0) {
         mapCtx.beginPath();
         mapCtx.moveTo(originScreen.x, 0);
         mapCtx.lineTo(originScreen.x, canvasHeight);
         mapCtx.stroke();
-        
-        // Label the Y-axis
         mapCtx.fillStyle = '#555';
         mapCtx.font = 'bold 12px Arial';
         mapCtx.textAlign = 'left';
         mapCtx.textBaseline = 'bottom';
         mapCtx.fillText('Y', originScreen.x + 6, 18);
     }
-    
-    // Draw X-axis (horizontal line at y=0)
     if (bottomWorld <= 0 && topWorld >= 0) {
         mapCtx.beginPath();
         mapCtx.moveTo(0, originScreen.y);
         mapCtx.lineTo(canvasWidth, originScreen.y);
         mapCtx.stroke();
-        
-        // Label the X-axis
         mapCtx.fillStyle = '#555';
         mapCtx.font = 'bold 12px Arial';
         mapCtx.textAlign = 'right';
         mapCtx.textBaseline = 'bottom';
         mapCtx.fillText('X', canvasWidth - 8, originScreen.y - 4);
     }
-    
-    // ============ X-AXIS TICKS AND LABELS (bottom edge) ============
+
+    // X ticks (bottom)
     const yPosForXLabels = bottomWorld;
     const xStart = Math.ceil(leftWorld / step) * step;
     const xEnd = Math.floor(rightWorld / step) * step;
-    
     mapCtx.fillStyle = '#666';
     mapCtx.font = '10px Arial';
     mapCtx.textAlign = 'center';
     mapCtx.textBaseline = 'top';
-    
     for (let x = xStart; x <= xEnd; x += step) {
-        if (Math.abs(x) < 0.001) continue; // Skip origin
-        const screen = worldToMapScreen(x, yPosForXLabels);
-        if (screen.x >= 0 && screen.x <= canvasWidth && screen.y >= 0 && screen.y <= canvasHeight) {
-            // Tick mark
-            mapCtx.strokeStyle = 'rgba(80, 80, 120, 0.3)';
+        if (Math.abs(x) < 0.001) continue;
+        const s = worldToMapScreen(x, yPosForXLabels);
+        if (s.x >= 0 && s.x <= canvasWidth && s.y >= 0 && s.y <= canvasHeight) {
+            mapCtx.strokeStyle = 'rgba(80,80,120,0.3)';
             mapCtx.lineWidth = 1;
             mapCtx.beginPath();
-            mapCtx.moveTo(screen.x, screen.y + 4);
-            mapCtx.lineTo(screen.x, screen.y + 10);
+            mapCtx.moveTo(s.x, s.y + 4);
+            mapCtx.lineTo(s.x, s.y + 10);
             mapCtx.stroke();
-            
-            // Label
             mapCtx.fillStyle = '#666';
-            mapCtx.fillText(x.toFixed(1), screen.x, screen.y + 12);
+            mapCtx.fillText(x.toFixed(1), s.x, s.y + 12);
         }
     }
-    
-    // ============ Y-AXIS TICKS AND LABELS (left edge) ============
+
+    // Y ticks (left)
     const xPosForYLabels = leftWorld;
     const yStart = Math.ceil(bottomWorld / step) * step;
     const yEnd = Math.floor(topWorld / step) * step;
-    
     mapCtx.textAlign = 'right';
     mapCtx.textBaseline = 'middle';
-    
     for (let y = yStart; y <= yEnd; y += step) {
-        if (Math.abs(y) < 0.001) continue; // Skip origin
-        const screen = worldToMapScreen(xPosForYLabels, y);
-        if (screen.x >= 0 && screen.x <= canvasWidth && screen.y >= 0 && screen.y <= canvasHeight) {
-            // Tick mark
-            mapCtx.strokeStyle = 'rgba(80, 80, 120, 0.3)';
+        if (Math.abs(y) < 0.001) continue;
+        const s = worldToMapScreen(xPosForYLabels, y);
+        if (s.x >= 0 && s.x <= canvasWidth && s.y >= 0 && s.y <= canvasHeight) {
+            mapCtx.strokeStyle = 'rgba(80,80,120,0.3)';
             mapCtx.lineWidth = 1;
             mapCtx.beginPath();
-            mapCtx.moveTo(screen.x - 4, screen.y);
-            mapCtx.lineTo(screen.x - 10, screen.y);
+            mapCtx.moveTo(s.x - 4, s.y);
+            mapCtx.lineTo(s.x - 10, s.y);
             mapCtx.stroke();
-            
-            // Label
             mapCtx.fillStyle = '#666';
-            mapCtx.fillText(y.toFixed(1), screen.x - 12, screen.y);
+            mapCtx.fillText(y.toFixed(1), s.x - 12, s.y);
         }
     }
-    
-    // ============ Y-AXIS TICKS AND LABELS (right edge) ============
-    // This is the missing part - show Y values on the right side too
+
+    // Y ticks (right)
     const xPosForYLabelsRight = rightWorld;
-    
     mapCtx.textAlign = 'left';
     mapCtx.textBaseline = 'middle';
-    
     for (let y = yStart; y <= yEnd; y += step) {
-        if (Math.abs(y) < 0.001) continue; // Skip origin (already labeled on left)
-        const screen = worldToMapScreen(xPosForYLabelsRight, y);
-        if (screen.x >= 0 && screen.x <= canvasWidth && screen.y >= 0 && screen.y <= canvasHeight) {
-            // Tick mark
-            mapCtx.strokeStyle = 'rgba(80, 80, 120, 0.3)';
+        if (Math.abs(y) < 0.001) continue;
+        const s = worldToMapScreen(xPosForYLabelsRight, y);
+        if (s.x >= 0 && s.x <= canvasWidth && s.y >= 0 && s.y <= canvasHeight) {
+            mapCtx.strokeStyle = 'rgba(80,80,120,0.3)';
             mapCtx.lineWidth = 1;
             mapCtx.beginPath();
-            mapCtx.moveTo(screen.x + 4, screen.y);
-            mapCtx.lineTo(screen.x + 10, screen.y);
+            mapCtx.moveTo(s.x + 4, s.y);
+            mapCtx.lineTo(s.x + 10, s.y);
             mapCtx.stroke();
-            
-            // Label
             mapCtx.fillStyle = '#666';
-            mapCtx.fillText(y.toFixed(1), screen.x + 12, screen.y);
+            mapCtx.fillText(y.toFixed(1), s.x + 12, s.y);
         }
     }
-    
-    // ============ X-AXIS TICKS AND LABELS (top edge) ============
-    // Also show X values on the top edge for completeness
+
+    // X ticks (top)
     const yPosForXLabelsTop = topWorld;
-    
     mapCtx.textAlign = 'center';
     mapCtx.textBaseline = 'bottom';
-    
     for (let x = xStart; x <= xEnd; x += step) {
-        if (Math.abs(x) < 0.001) continue; // Skip origin
-        const screen = worldToMapScreen(x, yPosForXLabelsTop);
-        if (screen.x >= 0 && screen.x <= canvasWidth && screen.y >= 0 && screen.y <= canvasHeight) {
-            // Tick mark
-            mapCtx.strokeStyle = 'rgba(80, 80, 120, 0.3)';
+        if (Math.abs(x) < 0.001) continue;
+        const s = worldToMapScreen(x, yPosForXLabelsTop);
+        if (s.x >= 0 && s.x <= canvasWidth && s.y >= 0 && s.y <= canvasHeight) {
+            mapCtx.strokeStyle = 'rgba(80,80,120,0.3)';
             mapCtx.lineWidth = 1;
             mapCtx.beginPath();
-            mapCtx.moveTo(screen.x, screen.y - 4);
-            mapCtx.lineTo(screen.x, screen.y - 10);
+            mapCtx.moveTo(s.x, s.y - 4);
+            mapCtx.lineTo(s.x, s.y - 10);
             mapCtx.stroke();
-            
-            // Label
             mapCtx.fillStyle = '#666';
-            mapCtx.fillText(x.toFixed(1), screen.x, screen.y - 12);
+            mapCtx.fillText(x.toFixed(1), s.x, s.y - 12);
         }
     }
-    
-    // ============ ORIGIN LABEL ============
+
     if (originVisible) {
         mapCtx.textAlign = 'left';
         mapCtx.textBaseline = 'bottom';
@@ -515,16 +423,12 @@ function drawMapAxes() {
         mapCtx.font = '10px Arial';
         mapCtx.fillText('0', originScreen.x + 4, originScreen.y - 4);
     }
-    
-    // ============ AXIS ARROWS ============
-    // Draw arrow heads on the positive axes if visible
-    mapCtx.fillStyle = 'rgba(100, 100, 150, 0.5)';
-    
-    // X-axis arrow (right side)
+
+    // arrows
+    mapCtx.fillStyle = 'rgba(100,100,150,0.5)';
     if (bottomWorld <= 0 && topWorld >= 0) {
         const rightEdgeX = worldToMapScreen(rightWorld - 0.1, 0);
         if (rightEdgeX.x < canvasWidth - 20) {
-            // Draw arrow head
             mapCtx.beginPath();
             mapCtx.moveTo(rightEdgeX.x + 10, rightEdgeX.y);
             mapCtx.lineTo(rightEdgeX.x + 2, rightEdgeX.y - 5);
@@ -533,12 +437,9 @@ function drawMapAxes() {
             mapCtx.fill();
         }
     }
-    
-    // Y-axis arrow (top side)
     if (leftWorld <= 0 && rightWorld >= 0) {
         const topEdgeY = worldToMapScreen(0, topWorld - 0.1);
         if (topEdgeY.y > 20) {
-            // Draw arrow head
             mapCtx.beginPath();
             mapCtx.moveTo(topEdgeY.x, topEdgeY.y - 10);
             mapCtx.lineTo(topEdgeY.x - 5, topEdgeY.y - 2);
@@ -550,10 +451,7 @@ function drawMapAxes() {
 }
 
 function drawMapCells(mapData) {
-    if (!mapData || !mapData.data) {
-        return;
-    }
-
+    if (!mapData || !mapData.data) return;
     const mapWidth = mapData.width;
     const mapHeight = mapData.height;
     const resolution = mapData.resolution;
@@ -561,49 +459,6 @@ function drawMapCells(mapData) {
     const mapOriginY = -mapHeight * resolution / 2;
     const cellSize = resolution * mapView.zoom;
 
-    // Skip drawing if cells are too small (performance)
-    if (cellSize < 0.5) {
-        // Draw a simplified version: only every 4th cell
-        const step = 4;
-        const visibleWorldWidth = mapCanvas.width / mapView.zoom;
-        const visibleWorldHeight = mapCanvas.height / mapView.zoom;
-        const leftWorld = mapView.centerX - visibleWorldWidth / 2 - resolution * step;
-        const rightWorld = mapView.centerX + visibleWorldWidth / 2 + resolution * step;
-        const bottomWorld = mapView.centerY - visibleWorldHeight / 2 - resolution * step;
-        const topWorld = mapView.centerY + visibleWorldHeight / 2 + resolution * step;
-
-        const gxStart = Math.max(0, Math.floor((leftWorld - mapOriginX) / resolution));
-        const gxEnd = Math.min(mapWidth - 1, Math.ceil((rightWorld - mapOriginX) / resolution));
-        const gyStart = Math.max(0, Math.floor((bottomWorld - mapOriginY) / resolution));
-        const gyEnd = Math.min(mapHeight - 1, Math.ceil((topWorld - mapOriginY) / resolution));
-
-        for (let gy = gyStart; gy <= gyEnd; gy += step) {
-            for (let gx = gxStart; gx <= gxEnd; gx += step) {
-                const value = mapData.data[gy * mapWidth + gx];
-                if (value < 0) continue;
-
-                const worldX = mapOriginX + gx * resolution;
-                const worldY = mapOriginY + gy * resolution;
-                const screen = worldToMapScreen(worldX, worldY);
-                const size = cellSize * step;
-
-                if (screen.x + size < 0 || screen.x > mapCanvas.width || 
-                    screen.y + size < 0 || screen.y > mapCanvas.height) {
-                    continue;
-                }
-
-                if (value >= 30) {
-                    mapCtx.fillStyle = 'rgba(255, 68, 68, 0.85)';
-                } else {
-                    mapCtx.fillStyle = 'rgba(101, 181, 255, 0.12)';
-                }
-                mapCtx.fillRect(screen.x, screen.y, size, size);
-            }
-        }
-        return;
-    }
-
-    // Normal drawing when cells are large enough
     const visibleWorldWidth = mapCanvas.width / mapView.zoom;
     const visibleWorldHeight = mapCanvas.height / mapView.zoom;
     const leftWorld = mapView.centerX - visibleWorldWidth / 2 - resolution;
@@ -616,55 +471,32 @@ function drawMapCells(mapData) {
     const gyStart = Math.max(0, Math.floor((bottomWorld - mapOriginY) / resolution));
     const gyEnd = Math.min(mapHeight - 1, Math.ceil((topWorld - mapOriginY) / resolution));
 
-    // Batch draw for performance
-    const batchSize = 500;
-    let batch = [];
+    // if cells are tiny, skip every 4th
+    const drawStep = cellSize < 0.5 ? 4 : 1;
 
-    for (let gy = gyStart; gy <= gyEnd; gy++) {
-        for (let gx = gxStart; gx <= gxEnd; gx++) {
+    for (let gy = gyStart; gy <= gyEnd; gy += drawStep) {
+        for (let gx = gxStart; gx <= gxEnd; gx += drawStep) {
             const value = mapData.data[gy * mapWidth + gx];
             if (value < 0) continue;
-
             const worldX = mapOriginX + gx * resolution;
             const worldY = mapOriginY + gy * resolution;
             const screen = worldToMapScreen(worldX, worldY);
-
-            if (screen.x + cellSize < 0 || screen.x > mapCanvas.width || 
-                screen.y + cellSize < 0 || screen.y > mapCanvas.height) {
-                continue;
-            }
-
-            const color = value >= 30 ? 
-                'rgba(255, 68, 68, 0.85)' : 
-                'rgba(101, 181, 255, 0.12)';
-            
-            batch.push({x: screen.x, y: screen.y, w: cellSize, h: cellSize, color: color});
-            
-            if (batch.length >= batchSize) {
-                for (const item of batch) {
-                    mapCtx.fillStyle = item.color;
-                    mapCtx.fillRect(item.x, item.y, item.w, item.h);
-                }
-                batch = [];
-            }
+            const size = cellSize * drawStep;
+            if (screen.x + size < 0 || screen.x > mapCanvas.width ||
+                screen.y + size < 0 || screen.y > mapCanvas.height) continue;
+            mapCtx.fillStyle = value >= 30 ? 'rgba(255,68,68,0.85)' : 'rgba(101,181,255,0.12)';
+            mapCtx.fillRect(screen.x, screen.y, size, size);
         }
-    }
-    
-    // Flush remaining batch
-    for (const item of batch) {
-        mapCtx.fillStyle = item.color;
-        mapCtx.fillRect(item.x, item.y, item.w, item.h);
     }
 }
 
 function drawRobotOnMap() {
     const screen = worldToMapScreen(robotX, robotY);
-    const heading = robotTheta + Math.PI; // invert, the one from simulation is inverted.
+    const heading = robotTheta + Math.PI;
     const forwardX = Math.cos(heading);
     const forwardY = Math.sin(heading);
     const leftX = -Math.sin(heading);
     const leftY = Math.cos(heading);
-
     const robotSize = 0.18;
     const nose = {
         x: screen.x + forwardX * robotSize * mapView.zoom,
@@ -700,25 +532,142 @@ function drawRobotOnMap() {
     mapCtx.fill();
 }
 
+function drawPath(path) {
+    // goal
+    if (currentGoal) {
+        const gs = worldToMapScreen(currentGoal.x, currentGoal.y);
+        const pulseRadius = 10 + 4 * Math.sin(Date.now() / 500);
+        const grad = mapCtx.createRadialGradient(gs.x, gs.y, 0, gs.x, gs.y, 20);
+        grad.addColorStop(0, 'rgba(255,0,0,0.6)');
+        grad.addColorStop(0.5, 'rgba(255,0,0,0.2)');
+        grad.addColorStop(1, 'rgba(255,0,0,0)');
+        mapCtx.fillStyle = grad;
+        mapCtx.beginPath();
+        mapCtx.arc(gs.x, gs.y, 20, 0, 2 * Math.PI);
+        mapCtx.fill();
+
+        mapCtx.fillStyle = '#ff0000';
+        mapCtx.beginPath();
+        mapCtx.arc(gs.x, gs.y, 6, 0, 2 * Math.PI);
+        mapCtx.fill();
+
+        mapCtx.strokeStyle = '#ff4444';
+        mapCtx.lineWidth = 2;
+        mapCtx.beginPath();
+        mapCtx.arc(gs.x, gs.y, 8, 0, 2 * Math.PI);
+        mapCtx.stroke();
+
+        mapCtx.fillStyle = '#ff0000';
+        mapCtx.font = 'bold 11px Arial';
+        mapCtx.textAlign = 'left';
+        mapCtx.textBaseline = 'bottom';
+        mapCtx.fillText('🎯 GOAL', gs.x + 12, gs.y - 4);
+        mapCtx.fillStyle = '#cc0000';
+        mapCtx.font = '9px Arial';
+        mapCtx.textAlign = 'left';
+        mapCtx.textBaseline = 'top';
+        mapCtx.fillText(`(${currentGoal.x.toFixed(2)}, ${currentGoal.y.toFixed(2)})`, gs.x + 12, gs.y + 4);
+    }
+
+    if (!path || path.length === 0) return;
+
+    // dashed line from robot to first waypoint
+    const robotScreen = worldToMapScreen(robotX, robotY);
+    const firstPoint = path[0];
+    const firstScreen = worldToMapScreen(firstPoint.x, firstPoint.y);
+    const dx = firstPoint.x - robotX;
+    const dy = firstPoint.y - robotY;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist > 0.1) {
+        mapCtx.setLineDash([6, 6]);
+        mapCtx.strokeStyle = 'rgba(255,136,0,0.4)';
+        mapCtx.lineWidth = 1.5;
+        mapCtx.beginPath();
+        mapCtx.moveTo(robotScreen.x, robotScreen.y);
+        mapCtx.lineTo(firstScreen.x, firstScreen.y);
+        mapCtx.stroke();
+        mapCtx.setLineDash([]);
+
+        const midX = (robotScreen.x + firstScreen.x) / 2;
+        const midY = (robotScreen.y + firstScreen.y) / 2;
+        const distText = dist.toFixed(2) + 'm';
+        mapCtx.fillStyle = 'rgba(244,247,251,0.8)';
+        const metrics = mapCtx.measureText(distText);
+        const pad = 4;
+        mapCtx.fillRect(midX - metrics.width / 2 - pad, midY - 16 - pad, metrics.width + pad * 2, 16 + pad * 2);
+        mapCtx.fillStyle = 'rgba(255,136,0,0.8)';
+        mapCtx.font = '9px Arial';
+        mapCtx.textAlign = 'center';
+        mapCtx.textBaseline = 'bottom';
+        mapCtx.fillText(distText, midX, midY - 4);
+    }
+
+    // path line
+    mapCtx.strokeStyle = '#ff8800';
+    mapCtx.lineWidth = 2.5;
+    mapCtx.setLineDash([]);
+    mapCtx.beginPath();
+    for (let i = 0; i < path.length; i++) {
+        const s = worldToMapScreen(path[i].x, path[i].y);
+        if (i === 0) mapCtx.moveTo(s.x, s.y);
+        else mapCtx.lineTo(s.x, s.y);
+    }
+    mapCtx.stroke();
+
+    // waypoints
+    for (let i = 0; i < path.length; i++) {
+        const s = worldToMapScreen(path[i].x, path[i].y);
+        const color = (i === 0) ? '#ff8800' : (i === path.length - 1 ? '#ff4400' : '#ffaa44');
+        const size = (i === 0 || i === path.length - 1) ? 5 : 3;
+        mapCtx.fillStyle = 'rgba(255,136,0,0.15)';
+        mapCtx.beginPath();
+        mapCtx.arc(s.x, s.y, size + 6, 0, 2 * Math.PI);
+        mapCtx.fill();
+        mapCtx.fillStyle = color;
+        mapCtx.beginPath();
+        mapCtx.arc(s.x, s.y, size, 0, 2 * Math.PI);
+        mapCtx.fill();
+        if (path.length <= 20) {
+            mapCtx.fillStyle = 'rgba(0,0,0,0.6)';
+            mapCtx.font = '8px Arial';
+            mapCtx.textAlign = 'center';
+            mapCtx.textBaseline = 'bottom';
+            mapCtx.fillText((i + 1).toString(), s.x, s.y - size - 4);
+        }
+    }
+
+    // total distance
+    let totalDist = 0;
+    for (let i = 1; i < path.length; i++) {
+        const dx = path[i].x - path[i - 1].x;
+        const dy = path[i].y - path[i - 1].y;
+        totalDist += Math.sqrt(dx * dx + dy * dy);
+    }
+    if (path.length > 1 && totalDist > 0.1) {
+        const last = path[path.length - 1];
+        const ls = worldToMapScreen(last.x, last.y);
+        const label = '📏 ' + totalDist.toFixed(2) + 'm';
+        mapCtx.fillStyle = 'rgba(244,247,251,0.85)';
+        const metrics = mapCtx.measureText(label);
+        const pad = 6;
+        mapCtx.fillRect(ls.x - metrics.width / 2 - pad, ls.y + 12 - pad, metrics.width + pad * 2, 20 + pad * 2);
+        mapCtx.fillStyle = '#cc6600';
+        mapCtx.font = '10px Arial';
+        mapCtx.textAlign = 'center';
+        mapCtx.textBaseline = 'top';
+        mapCtx.fillText(label, ls.x, ls.y + 14);
+    }
+}
+
 function renderMapView() {
     mapCtx.clearRect(0, 0, mapCanvas.width, mapCanvas.height);
     mapCtx.fillStyle = '#f4f7fb';
     mapCtx.fillRect(0, 0, mapCanvas.width, mapCanvas.height);
 
-    // Draw axes
     drawMapAxes();
-
-    // Draw map cells (if enabled)
-    if (currentMap) {
-        drawMapCells(currentMap);
-    }
-
-    // Draw the coarse grid (toggleable)
+    if (currentMap) drawMapCells(currentMap);
     drawCoarseGrid(currentCoarseGrid);
-
     drawRobotOnMap();
-
-    // Draw planned path if available
     drawPath(currentPath);
 
     mapCtx.fillStyle = '#1f2937';
@@ -731,12 +680,76 @@ function renderMapView() {
 }
 
 function renderActiveView() {
-    if (activeView === 'map') {
-        renderMapView();
-    } else {
-        renderRadarView();
-    }
+    if (activeView === 'map') renderMapView();
+    else renderRadarView();
 }
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  MODE SELECTOR (core)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+function setMode(mode, silent = false) {
+    if (mode === currentMode) return;
+
+    const prevMode = currentMode;
+    currentMode = mode;
+
+    // update UI: buttons
+    document.querySelectorAll('.mode-btn').forEach((btn) => {
+        const isActive = btn.dataset.mode === mode;
+        btn.classList.toggle('active', isActive);
+    });
+
+    // keyboard hint
+    const hint = document.getElementById('keyboardHint');
+    if (mode === 'manual') {
+        hint.classList.add('visible');
+    } else {
+        hint.classList.remove('visible');
+    }
+
+    // update info panel
+    const modeLabels = { idle: 'Idle', manual: 'Manual', auto: 'Auto' };
+    document.getElementById('robotMode').innerHTML = modeLabels[mode] || mode;
+
+    // if silent, stop here (used when syncing from server)
+    if (silent) return;
+
+    // send command to server
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+        console.warn('[Mode] Not connected – mode set locally only');
+        return;
+    }
+
+    switch (mode) {
+        case 'idle':
+            sendCommand('stop');
+            break;
+        case 'manual':
+            ws.send(JSON.stringify({ type: 'autonomy', auto_navigate: false }));
+            break;
+        case 'auto':
+            sendCommand('auto');
+            break;
+        default:
+            break;
+    }
+
+    console.log(`[Mode] → ${mode}${prevMode ? ` (was ${prevMode})` : ''}`);
+}
+
+// ── backward-compatible helpers ──
+function enableManualDriving() {
+    setMode('manual');
+}
+
+function disableManualDriving() {
+    setMode('idle');
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  NETWORK
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 function updateScanRate(currentTime) {
     if (lastScanTime > 0) {
@@ -747,7 +760,6 @@ function updateScanRate(currentTime) {
             document.getElementById('scanRate').innerHTML = scanRate.toFixed(1) + ' Hz';
         }
     }
-
     lastScanTime = currentTime;
     scanCount++;
 }
@@ -796,50 +808,69 @@ function connectWebSocket() {
                 updateScanRate(data.timestamp || 0);
 
                 document.getElementById('numPoints').innerHTML = (data.num_points || 0).toLocaleString();
-                document.getElementById('rangeLimit').innerHTML = `${(data.min_range || 0).toFixed(1)}-${(data.max_range || 0).toFixed(1)} m`;
+                document.getElementById('rangeLimit').innerHTML =
+                    `${(data.min_range || 0).toFixed(1)}–${(data.max_range || 0).toFixed(1)} m`;
                 document.getElementById('lastScan').innerHTML = (data.timestamp || 0).toFixed(2) + ' s';
                 document.getElementById('leftSpeed').innerHTML = leftSpeed.toFixed(2) + ' m/s';
                 document.getElementById('rightSpeed').innerHTML = rightSpeed.toFixed(2) + ' m/s';
-                document.getElementById('robotMode').innerHTML = autoMode ? '🤖 Auto' : '🎮 Manual';
                 document.getElementById('posX').innerHTML = robotX.toFixed(2) + ' m';
                 document.getElementById('posY').innerHTML = robotY.toFixed(2) + ' m';
                 document.getElementById('theta').innerHTML = (robotTheta * 180 / Math.PI).toFixed(1) + ' °';
                 document.getElementById('linearVel').innerHTML = linearVel.toFixed(2) + ' m/s';
 
-                if (data.map) {
-                    currentMap = data.map;
-                }
-                if (data.coarse_grid) {
-                    currentCoarseGrid = data.coarse_grid;
-                    console.log('[DEBUG] Received coarse grid:', currentCoarseGrid.width, 'x', currentCoarseGrid.height);
+                // if server sends auto_navigate, sync mode (silent)
+                if (data.auto_navigate !== undefined) {
+                    const serverMode = data.auto_navigate ? 'auto' : 'manual';
+                    // only sync if different, and avoid overriding user's idle choice
+                    if (serverMode !== currentMode) {
+                        // If server says auto and we're in idle, switch to auto
+                        // If server says manual and we're in idle, stay idle (user chose idle)
+                        if (serverMode === 'auto') {
+                            setMode('auto', true);
+                        } else if (serverMode === 'manual' && currentMode !== 'idle') {
+                            setMode('manual', true);
+                        }
+                        // if we're in idle and server says manual, keep idle
+                    }
                 }
 
-                // Update path if present
+                if (data.map) currentMap = data.map;
+                if (data.coarse_grid) {
+                    currentCoarseGrid = data.coarse_grid;
+                }
                 if (data.path) {
                     currentPath = data.path.map(p => ({ x: p.x, y: p.y }));
                 } else {
                     currentPath = [];
                 }
-
                 if (data.goal) {
                     currentGoal = { x: data.goal.x, y: data.goal.y };
-                    console.log('[Goal] Updated goal:', currentGoal);
                 }
 
                 renderActiveView();
 
-                // Debug: log occasionally
                 if (scanCount % 100 === 0) {
-                    console.log(`[Update] pose=(${robotX.toFixed(2)}, ${robotY.toFixed(2)}), score=${slamMatchScore.toFixed(3)}`);
+                    console.log(`[Update] pose=(${robotX.toFixed(2)},${robotY.toFixed(2)})`);
                 }
             } else if (data.type === 'robot_info') {
                 document.getElementById('leftSpeed').innerHTML = (data.left_speed || 0).toFixed(2) + ' m/s';
                 document.getElementById('rightSpeed').innerHTML = (data.right_speed || 0).toFixed(2) + ' m/s';
-                document.getElementById('robotMode').innerHTML = data.auto_navigate ? '🤖 Auto' : '🎮 Manual';
                 document.getElementById('posX').innerHTML = (data.x || 0).toFixed(2) + ' m';
                 document.getElementById('posY').innerHTML = (data.y || 0).toFixed(2) + ' m';
                 document.getElementById('theta').innerHTML = ((data.theta || 0) * 180 / Math.PI).toFixed(1) + ' °';
                 document.getElementById('linearVel').innerHTML = (data.linear_vel || 0).toFixed(2) + ' m/s';
+
+                // sync mode from server
+                if (data.auto_navigate !== undefined) {
+                    const serverMode = data.auto_navigate ? 'auto' : 'manual';
+                    if (serverMode !== currentMode) {
+                        if (serverMode === 'auto') {
+                            setMode('auto', true);
+                        } else if (serverMode === 'manual' && currentMode !== 'idle') {
+                            setMode('manual', true);
+                        }
+                    }
+                }
             }
         } catch (error) {
             console.error('[WebSocket] Parse error:', error);
@@ -878,94 +909,79 @@ function sendCommand(command) {
         console.warn('[Command] Not connected');
         return;
     }
-
     const cmd = { type: 'command', command: command };
     ws.send(JSON.stringify(cmd));
     console.log('[Command] Sent:', command);
 }
 
-function enableManualDriving() {
-    manualDriving = true;
-    const btn = document.getElementById('driveManualBtn');
-    btn.disabled = true;
-    document.getElementById('keyboardHint').style.display = 'block';
-    console.log('[Manual] Keyboard control enabled - Arrow keys to drive, Space=stop, Q=quit');
-    
-    // Send a message to the robot to switch to manual mode if needed
-    if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'autonomy', auto_navigate: false }));
-    }
-}
-
-function disableManualDriving() {
-    manualDriving = false;
-    const btn = document.getElementById('driveManualBtn');
-    btn.disabled = false;
-    document.getElementById('keyboardHint').style.display = 'none';
-    console.log('[Manual] Keyboard control disabled');
-}
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  KEYBOARD
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 function setupKeyboardControls() {
     document.addEventListener('keydown', function(event) {
-        // Toggle manual driving off with 'q'
+        // Q → idle (quit manual)
         if (event.key === 'q' || event.key === 'Q') {
-            if (manualDriving) {
-                disableManualDriving();
-                // Send stop command when quitting manual mode
+            if (currentMode === 'manual') {
+                setMode('idle');
                 sendCommand('stop');
             }
+            event.preventDefault();
             return;
         }
 
-        // Only forward movement commands while manual driving is enabled
-        if (manualDriving) {
-            switch (event.key) {
-                case 'ArrowUp':
-                    sendCommand('forward');
-                    event.preventDefault();
-                    break;
-                case 'ArrowDown':
-                    sendCommand('backward');
-                    event.preventDefault();
-                    break;
-                case 'ArrowLeft':
-                    sendCommand('left');
-                    event.preventDefault();
-                    break;
-                case 'ArrowRight':
-                    sendCommand('right');
-                    event.preventDefault();
-                    break;
-                case ' ':
-                    sendCommand('stop');
-                    event.preventDefault();
-                    break;
-                case 'a':
-                case 'A':
-                    sendCommand('auto');
-                    event.preventDefault();
-                    break;
-                case 'm':
-                case 'M':
-                    showView('map');
-                    event.preventDefault();
-                    break;
-                case 'r':
-                case 'R':
-                    showView('radar');
-                    event.preventDefault();
-                    break;
-            }
+        // only forward commands in manual mode
+        if (currentMode !== 'manual') return;
+
+        switch (event.key) {
+            case 'ArrowUp':
+                sendCommand('forward');
+                event.preventDefault();
+                break;
+            case 'ArrowDown':
+                sendCommand('backward');
+                event.preventDefault();
+                break;
+            case 'ArrowLeft':
+                sendCommand('left');
+                event.preventDefault();
+                break;
+            case 'ArrowRight':
+                sendCommand('right');
+                event.preventDefault();
+                break;
+            case ' ':
+                sendCommand('stop');
+                event.preventDefault();
+                break;
+            case 'a':
+            case 'A':
+                setMode('auto');
+                event.preventDefault();
+                break;
+            case 'm':
+            case 'M':
+                showView('map');
+                event.preventDefault();
+                break;
+            case 'r':
+            case 'R':
+                showView('radar');
+                event.preventDefault();
+                break;
+            default:
+                break;
         }
     });
 }
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  MAP INTERACTIONS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 function setupMapInteractions() {
     mapCanvas.addEventListener('mousedown', function(event) {
-        if (activeView !== 'map') {
-            return;
-        }
-
+        if (activeView !== 'map') return;
         mapView.dragging = true;
         mapView.dragStartX = event.clientX;
         mapView.dragStartY = event.clientY;
@@ -974,19 +990,12 @@ function setupMapInteractions() {
     });
 
     window.addEventListener('mousemove', function(event) {
-        if (!mapView.dragging) {
-            return;
-        }
-
+        if (!mapView.dragging) return;
         const deltaX = event.clientX - mapView.dragStartX;
         const deltaY = event.clientY - mapView.dragStartY;
-
         mapView.centerX = mapView.dragOriginX - deltaX / mapView.zoom;
         mapView.centerY = mapView.dragOriginY - deltaY / mapView.zoom;
-
-        if (activeView === 'map') {
-            renderMapView();
-        }
+        if (activeView === 'map') renderMapView();
     });
 
     window.addEventListener('mouseup', function() {
@@ -994,32 +1003,21 @@ function setupMapInteractions() {
     });
 
     mapCanvas.addEventListener('wheel', function(event) {
-        if (activeView !== 'map') {
-            return;
-        }
-
+        if (activeView !== 'map') return;
         event.preventDefault();
-
         const rect = mapCanvas.getBoundingClientRect();
         const scaleX = mapCanvas.width / rect.width;
         const scaleY = mapCanvas.height / rect.height;
-        
         const mouseX = (event.clientX - rect.left) * scaleX;
         const mouseY = (event.clientY - rect.top) * scaleY;
-
         const zoomFactor = event.deltaY < 0 ? 1.12 : 1 / 1.12;
-        
         const mouseWorld = mapScreenToWorld(mouseX, mouseY);
-        
         mapView.zoom = clamp(mapView.zoom * zoomFactor, 10, 180);
-        
         mapView.centerX = mouseWorld.x - (mouseX - mapCanvas.width / 2) / mapView.zoom;
         mapView.centerY = mouseWorld.y - (mouseY - mapCanvas.height / 2) / mapView.zoom;
-
         renderMapView();
     }, { passive: false });
-    
-    // Double-click to set a goal
+
     mapCanvas.addEventListener('dblclick', function(event) {
         if (activeView !== 'map') return;
         const rect = mapCanvas.getBoundingClientRect();
@@ -1028,21 +1026,18 @@ function setupMapInteractions() {
         const canvasX = (event.clientX - rect.left) * scaleX;
         const canvasY = (event.clientY - rect.top) * scaleY;
         const world = mapScreenToWorld(canvasX, canvasY);
-        
-        // Store goal locally
         currentGoal = { x: world.x, y: world.y };
         console.log('[Map] Goal set at', world.x.toFixed(2), world.y.toFixed(2));
-        
         if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: 'set_goal', x: world.x, y: world.y }));
         }
-        
-        // Immediately update the map to show the goal
-        if (activeView === 'map') {
-            renderMapView();
-        }
+        if (activeView === 'map') renderMapView();
     });
 }
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  BOOT
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 window.addEventListener('load', function() {
     console.log('[App] Initializing...');
@@ -1053,13 +1048,17 @@ window.addEventListener('load', function() {
 
     document.getElementById('wsUrl').value = 'ws://localhost:8766';
 
+    // set initial mode (idle)
+    setMode('idle', true);
+
+    // defaults
     document.getElementById('numPoints').innerHTML = '0';
-    document.getElementById('rangeLimit').innerHTML = '0-0 m';
+    document.getElementById('rangeLimit').innerHTML = '0–0 m';
     document.getElementById('lastScan').innerHTML = '0 s';
     document.getElementById('scanRate').innerHTML = '0 Hz';
     document.getElementById('leftSpeed').innerHTML = '0.00 m/s';
     document.getElementById('rightSpeed').innerHTML = '0.00 m/s';
-    document.getElementById('robotMode').innerHTML = 'Auto';
+    document.getElementById('robotMode').innerHTML = 'Idle';
     document.getElementById('posX').innerHTML = '0.00 m';
     document.getElementById('posY').innerHTML = '0.00 m';
     document.getElementById('theta').innerHTML = '0.00 °';
@@ -1067,8 +1066,6 @@ window.addEventListener('load', function() {
 
     updateZoomDisplay();
     showView('map');
-
-    // Set initial grid toggle button text
     document.getElementById('toggleGridBtn').textContent = 'Hide Grid';
 
     setTimeout(() => {
@@ -1077,198 +1074,6 @@ window.addEventListener('load', function() {
     }, 1000);
 
     document.getElementById('wsUrl').addEventListener('keypress', function(event) {
-        if (event.key === 'Enter') {
-            connectWebSocket();
-        }
+        if (event.key === 'Enter') connectWebSocket();
     });
 });
-
-// Add these variables at the top with other data storage
-let currentGoal = null;  // Store the current goal position
-
-// Update the drawPath function
-function drawPath(path) {
-    // ============ DRAW GOAL POINT ============
-    if (currentGoal) {
-        const goalScreen = worldToMapScreen(currentGoal.x, currentGoal.y);
-        
-        // Draw a pulsing circle for the goal
-        const pulseRadius = 10 + 4 * Math.sin(Date.now() / 500);
-        
-        // Outer glow
-        const gradient = mapCtx.createRadialGradient(
-            goalScreen.x, goalScreen.y, 0,
-            goalScreen.x, goalScreen.y, 20
-        );
-        gradient.addColorStop(0, 'rgba(255, 0, 0, 0.6)');
-        gradient.addColorStop(0.5, 'rgba(255, 0, 0, 0.2)');
-        gradient.addColorStop(1, 'rgba(255, 0, 0, 0)');
-        mapCtx.fillStyle = gradient;
-        mapCtx.beginPath();
-        mapCtx.arc(goalScreen.x, goalScreen.y, 20, 0, 2 * Math.PI);
-        mapCtx.fill();
-        
-        // Goal point
-        mapCtx.fillStyle = '#ff0000';
-        mapCtx.beginPath();
-        mapCtx.arc(goalScreen.x, goalScreen.y, 6, 0, 2 * Math.PI);
-        mapCtx.fill();
-        
-        // Goal border
-        mapCtx.strokeStyle = '#ff4444';
-        mapCtx.lineWidth = 2;
-        mapCtx.beginPath();
-        mapCtx.arc(goalScreen.x, goalScreen.y, 8, 0, 2 * Math.PI);
-        mapCtx.stroke();
-        
-        // Goal label
-        mapCtx.fillStyle = '#ff0000';
-        mapCtx.font = 'bold 11px Arial';
-        mapCtx.textAlign = 'left';
-        mapCtx.textBaseline = 'bottom';
-        mapCtx.fillText('🎯 GOAL', goalScreen.x + 12, goalScreen.y - 4);
-        mapCtx.fillStyle = '#cc0000';
-        mapCtx.font = '9px Arial';
-        mapCtx.textAlign = 'left';
-        mapCtx.textBaseline = 'top';
-        mapCtx.fillText(`(${currentGoal.x.toFixed(2)}, ${currentGoal.y.toFixed(2)})`, goalScreen.x + 12, goalScreen.y + 4);
-    }
-    
-    // ============ DRAW PATH ============
-    if (!path || path.length === 0) {
-        return;
-    }
-    
-    // ============ DASHED LINE FROM ROBOT TO FIRST WAYPOINT ============
-    // Get robot position
-    const robotScreen = worldToMapScreen(robotX, robotY);
-    const firstPoint = path[0];
-    const firstScreen = worldToMapScreen(firstPoint.x, firstPoint.y);
-    
-    // Calculate distance from robot to first waypoint
-    const dx = firstPoint.x - robotX;
-    const dy = firstPoint.y - robotY;
-    const distance = Math.sqrt(dx*dx + dy*dy);
-    
-    // Draw dashed line if distance is significant (> 0.1m)
-    if (distance > 0.1) {
-        mapCtx.setLineDash([6, 6]);
-        mapCtx.strokeStyle = 'rgba(255, 136, 0, 0.4)';
-        mapCtx.lineWidth = 1.5;
-        mapCtx.beginPath();
-        mapCtx.moveTo(robotScreen.x, robotScreen.y);
-        mapCtx.lineTo(firstScreen.x, firstScreen.y);
-        mapCtx.stroke();
-        mapCtx.setLineDash([]); // Reset to solid line
-        
-        // Add a small "connection" label at midpoint
-        const midX = (robotScreen.x + firstScreen.x) / 2;
-        const midY = (robotScreen.y + firstScreen.y) / 2;
-        mapCtx.fillStyle = 'rgba(255, 136, 0, 0.6)';
-        mapCtx.font = '9px Arial';
-        mapCtx.textAlign = 'center';
-        mapCtx.textBaseline = 'bottom';
-        const distText = distance.toFixed(2) + 'm';
-        // Background for better readability
-        const metrics = mapCtx.measureText(distText);
-        const padding = 4;
-        mapCtx.fillStyle = 'rgba(244, 247, 251, 0.8)';
-        mapCtx.fillRect(
-            midX - metrics.width/2 - padding,
-            midY - 16 - padding,
-            metrics.width + padding*2,
-            16 + padding*2
-        );
-        mapCtx.fillStyle = 'rgba(255, 136, 0, 0.8)';
-        mapCtx.fillText(distText, midX, midY - 4);
-    }
-    
-    // ============ DRAW PATH WAYPOINTS ============
-    // Draw the path as a solid line with waypoints
-    mapCtx.strokeStyle = '#ff8800';
-    mapCtx.lineWidth = 2.5;
-    mapCtx.setLineDash([]);
-    mapCtx.beginPath();
-    
-    for (let i = 0; i < path.length; i++) {
-        const p = path[i];
-        const s = worldToMapScreen(p.x, p.y);
-        if (i === 0) {
-            mapCtx.moveTo(s.x, s.y);
-        } else {
-            mapCtx.lineTo(s.x, s.y);
-        }
-    }
-    mapCtx.stroke();
-    
-    // Draw waypoint markers
-    for (let i = 0; i < path.length; i++) {
-        const p = path[i];
-        const s = worldToMapScreen(p.x, p.y);
-        
-        // Different colors for first and last waypoints
-        let color, size;
-        if (i === 0) {
-            color = '#ff8800';
-            size = 5;
-        } else if (i === path.length - 1) {
-            color = '#ff4400';
-            size = 5;
-        } else {
-            color = '#ffaa44';
-            size = 3;
-        }
-        
-        // Outer glow for waypoints
-        mapCtx.fillStyle = 'rgba(255, 136, 0, 0.15)';
-        mapCtx.beginPath();
-        mapCtx.arc(s.x, s.y, size + 6, 0, 2 * Math.PI);
-        mapCtx.fill();
-        
-        // Waypoint point
-        mapCtx.fillStyle = color;
-        mapCtx.beginPath();
-        mapCtx.arc(s.x, s.y, size, 0, 2 * Math.PI);
-        mapCtx.fill();
-        
-        // Waypoint number (only if path is not too long)
-        if (path.length <= 20) {
-            mapCtx.fillStyle = 'rgba(0,0,0,0.6)';
-            mapCtx.font = '8px Arial';
-            mapCtx.textAlign = 'center';
-            mapCtx.textBaseline = 'bottom';
-            mapCtx.fillText((i + 1).toString(), s.x, s.y - size - 4);
-        }
-    }
-    
-    // ============ PATH DISTANCE LABEL ============
-    // Calculate total path length
-    let totalDistance = 0;
-    for (let i = 1; i < path.length; i++) {
-        const dx = path[i].x - path[i-1].x;
-        const dy = path[i].y - path[i-1].y;
-        totalDistance += Math.sqrt(dx*dx + dy*dy);
-    }
-    
-    if (path.length > 1 && totalDistance > 0.1) {
-        // Display total path length at the end of the path
-        const lastPoint = path[path.length - 1];
-        const lastScreen = worldToMapScreen(lastPoint.x, lastPoint.y);
-        
-        const label = '📏 ' + totalDistance.toFixed(2) + 'm';
-        mapCtx.fillStyle = 'rgba(244, 247, 251, 0.85)';
-        const metrics = mapCtx.measureText(label);
-        const padding = 6;
-        mapCtx.fillRect(
-            lastScreen.x - metrics.width/2 - padding,
-            lastScreen.y + 12 - padding,
-            metrics.width + padding*2,
-            20 + padding*2
-        );
-        mapCtx.fillStyle = '#cc6600';
-        mapCtx.font = '10px Arial';
-        mapCtx.textAlign = 'center';
-        mapCtx.textBaseline = 'top';
-        mapCtx.fillText(label, lastScreen.x, lastScreen.y + 14);
-    }
-}
