@@ -289,6 +289,18 @@ function drawCoarseGrid(coarseGridData) {
     }
 }
 
+function niceStep(range, targetTicks = 6) {
+    const rough = range / targetTicks;
+    const magnitude = Math.pow(10, Math.floor(Math.log10(rough)));
+    const normalized = rough / magnitude;
+    let nice;
+    if (normalized < 1.5) nice = 1;
+    else if (normalized < 3.5) nice = 2;
+    else if (normalized < 7.5) nice = 5;
+    else nice = 10;
+    return nice * magnitude;
+}
+
 function drawMapAxes() {
     const canvasWidth = mapCanvas.width;
     const canvasHeight = mapCanvas.height;
@@ -299,10 +311,13 @@ function drawMapAxes() {
     const bottomWorld = mapView.centerY - visibleWorldHeight / 2;
     const topWorld = mapView.centerY + visibleWorldHeight / 2;
 
-    let range = Math.max(visibleWorldWidth, visibleWorldHeight);
-    let step = Math.pow(10, Math.floor(Math.log10(range / 5)));
-    if (range / step < 4) step /= 2;
-    if (range / step < 2) step /= 2;
+    const rangeX = visibleWorldWidth;
+    const rangeY = visibleWorldHeight;
+    const stepx = niceStep(rangeX, 12);
+    const stepy = niceStep(rangeY, 15);
+
+    // Debug every 10th render
+    const debug = (scanCount % 10 === 0);
 
     const originScreen = worldToMapScreen(0, 0);
     const originVisible = (leftWorld <= 0 && rightWorld >= 0 && bottomWorld <= 0 && topWorld >= 0);
@@ -334,88 +349,81 @@ function drawMapAxes() {
         mapCtx.fillText('X', canvasWidth - 8, originScreen.y - 4);
     }
 
-    // X ticks (bottom)
-    const yPosForXLabels = bottomWorld;
-    const xStart = Math.ceil(leftWorld / step) * step;
-    const xEnd = Math.floor(rightWorld / step) * step;
-    mapCtx.fillStyle = '#666';
-    mapCtx.font = '10px Arial';
-    mapCtx.textAlign = 'center';
-    mapCtx.textBaseline = 'top';
-    for (let x = xStart; x <= xEnd; x += step) {
-        if (Math.abs(x) < 0.001) continue;
-        const s = worldToMapScreen(x, yPosForXLabels);
-        if (s.x >= 0 && s.x <= canvasWidth && s.y >= 0 && s.y <= canvasHeight) {
-            mapCtx.strokeStyle = 'rgba(80,80,120,0.3)';
-            mapCtx.lineWidth = 1;
-            mapCtx.beginPath();
-            mapCtx.moveTo(s.x, s.y + 4);
-            mapCtx.lineTo(s.x, s.y + 10);
-            mapCtx.stroke();
-            mapCtx.fillStyle = '#666';
-            mapCtx.fillText(x.toFixed(1), s.x, s.y + 12);
-        }
-    }
-
-    // Y ticks (left)
+    // Y ticks (left) – draw at left edge
     const xPosForYLabels = leftWorld;
-    const yStart = Math.ceil(bottomWorld / step) * step;
-    const yEnd = Math.floor(topWorld / step) * step;
-    mapCtx.textAlign = 'right';
-    mapCtx.textBaseline = 'middle';
-    for (let y = yStart; y <= yEnd; y += step) {
-        if (Math.abs(y) < 0.001) continue;
-        const s = worldToMapScreen(xPosForYLabels, y);
-        if (s.x >= 0 && s.x <= canvasWidth && s.y >= 0 && s.y <= canvasHeight) {
-            mapCtx.strokeStyle = 'rgba(80,80,120,0.3)';
-            mapCtx.lineWidth = 1;
-            mapCtx.beginPath();
-            mapCtx.moveTo(s.x - 4, s.y);
-            mapCtx.lineTo(s.x - 10, s.y);
-            mapCtx.stroke();
-            mapCtx.fillStyle = '#666';
-            mapCtx.fillText(y.toFixed(1), s.x - 12, s.y);
-        }
+    const yStart = Math.ceil(bottomWorld / stepy) * stepy;
+    const yEnd = Math.floor(topWorld / stepy) * stepy;
+
+    if (debug) {
+        console.log(`[Y] bottom=${bottomWorld.toFixed(6)}, top=${topWorld.toFixed(6)}, stepy=${stepy.toFixed(6)}`);
+        console.log(`[Y] yStart=${yStart.toFixed(6)}, yEnd=${yEnd.toFixed(6)}, ticks=${yStart <= yEnd ? ((yEnd - yStart) / stepy + 1).toFixed(0) : 0}`);
     }
 
-    // Y ticks (right)
-    const xPosForYLabelsRight = rightWorld;
-    mapCtx.textAlign = 'left';
-    mapCtx.textBaseline = 'middle';
-    for (let y = yStart; y <= yEnd; y += step) {
-        if (Math.abs(y) < 0.001) continue;
-        const s = worldToMapScreen(xPosForYLabelsRight, y);
-        if (s.x >= 0 && s.x <= canvasWidth && s.y >= 0 && s.y <= canvasHeight) {
-            mapCtx.strokeStyle = 'rgba(80,80,120,0.3)';
-            mapCtx.lineWidth = 1;
-            mapCtx.beginPath();
-            mapCtx.moveTo(s.x + 4, s.y);
-            mapCtx.lineTo(s.x + 10, s.y);
-            mapCtx.stroke();
-            mapCtx.fillStyle = '#666';
-            mapCtx.fillText(y.toFixed(1), s.x + 12, s.y);
+    if (yStart <= yEnd) {
+        let drawn = 0;
+        for (let y = yStart; y <= yEnd; y += stepy) {
+            if (Math.abs(y) < 0.001) continue;
+            const s = worldToMapScreen(xPosForYLabels, y);
+            // Only check y is within canvas; x is always at left edge (≈0)
+            if (s.y >= 0 && s.y <= canvasHeight) {
+                // Draw tick from x=0 to x=6 (inward)
+                mapCtx.strokeStyle = 'rgba(80,80,120,0.3)';
+                mapCtx.lineWidth = 1;
+                mapCtx.beginPath();
+                mapCtx.moveTo(0, s.y);
+                mapCtx.lineTo(6, s.y);
+                mapCtx.stroke();
+                // Draw label at x=10 (inside), aligned left
+                mapCtx.fillStyle = '#666';
+                mapCtx.textAlign = 'left';
+                mapCtx.textBaseline = 'middle';
+                mapCtx.fillText(y.toFixed(1), 10, s.y);
+                drawn++;
+            }
         }
+        if (debug) console.log(`[Y] drawn ${drawn} visible ticks`);
+    } else {
+        if (debug) console.warn('[Y] ❌ NO TICKS – yStart > yEnd');
     }
 
-    // X ticks (top)
+    // X ticks (top) – draw at top edge
     const yPosForXLabelsTop = topWorld;
-    mapCtx.textAlign = 'center';
-    mapCtx.textBaseline = 'bottom';
-    for (let x = xStart; x <= xEnd; x += step) {
-        if (Math.abs(x) < 0.001) continue;
-        const s = worldToMapScreen(x, yPosForXLabelsTop);
-        if (s.x >= 0 && s.x <= canvasWidth && s.y >= 0 && s.y <= canvasHeight) {
-            mapCtx.strokeStyle = 'rgba(80,80,120,0.3)';
-            mapCtx.lineWidth = 1;
-            mapCtx.beginPath();
-            mapCtx.moveTo(s.x, s.y - 4);
-            mapCtx.lineTo(s.x, s.y - 10);
-            mapCtx.stroke();
-            mapCtx.fillStyle = '#666';
-            mapCtx.fillText(x.toFixed(1), s.x, s.y - 12);
-        }
+    const xStart = Math.ceil(leftWorld / stepx) * stepx;
+    const xEnd = Math.floor(rightWorld / stepx) * stepx;
+
+    if (debug) {
+        console.log(`[X] left=${leftWorld.toFixed(6)}, right=${rightWorld.toFixed(6)}, stepx=${stepx.toFixed(6)}`);
+        console.log(`[X] xStart=${xStart.toFixed(6)}, xEnd=${xEnd.toFixed(6)}, ticks=${xStart <= xEnd ? ((xEnd - xStart) / stepx + 1).toFixed(0) : 0}`);
     }
 
+    if (xStart <= xEnd) {
+        let drawn = 0;
+        for (let x = xStart; x <= xEnd; x += stepx) {
+            if (Math.abs(x) < 0.001) continue;
+            const s = worldToMapScreen(x, yPosForXLabelsTop);
+            // Only check x is within canvas; y is always at top edge (≈0)
+            if (s.x >= 0 && s.x <= canvasWidth) {
+                // Draw tick from y=0 to y=6 (downward)
+                mapCtx.strokeStyle = 'rgba(80,80,120,0.3)';
+                mapCtx.lineWidth = 1;
+                mapCtx.beginPath();
+                mapCtx.moveTo(s.x, 0);
+                mapCtx.lineTo(s.x, 6);
+                mapCtx.stroke();
+                // Draw label at y=10 (inside), aligned center
+                mapCtx.fillStyle = '#666';
+                mapCtx.textAlign = 'center';
+                mapCtx.textBaseline = 'top';
+                mapCtx.fillText(x.toFixed(1), s.x, 10);
+                drawn++;
+            }
+        }
+        if (debug) console.log(`[X] drawn ${drawn} visible ticks`);
+    } else {
+        if (debug) console.warn('[X] ❌ NO TICKS – xStart > xEnd');
+    }
+
+    // origin label
     if (originVisible) {
         mapCtx.textAlign = 'left';
         mapCtx.textBaseline = 'bottom';
