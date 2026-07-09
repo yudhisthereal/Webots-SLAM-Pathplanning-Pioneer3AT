@@ -3,6 +3,7 @@
 UDP to WebSocket Bridge with Grid Map SLAM
 Clean architecture with atomic shared state and generation counters
 Modified to use a reverse WebSocket connection to a relay server.
+Supports waypoint following with continuous replanning.
 """
 
 import asyncio
@@ -18,7 +19,7 @@ import queue
 import ssl
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Optional, Tuple, Any
+from typing import Optional, Tuple, Any, List
 from scipy.ndimage import binary_dilation, generate_binary_structure
 
 # ============ Configuration ============
@@ -29,7 +30,7 @@ BROADCAST_MAP_HZ = 1    # 1 Hz map updates
 
 # Planner settings
 COARSE_FACTOR = 4  # COARSE_FACTOR^2 fine cells per coarse cell
-ROBOT_WIDTH = 0.35  # meters
+ROBOT_WIDTH = 0.41  # meters
 
 # UDP ports for robot communication
 ROBOT_DATA_PORT = 8765    # Robot → Bridge (LiDAR/odometry)
@@ -37,7 +38,7 @@ ROBOT_CMD_PORT = 8767     # Bridge → Robot (Commands)
 ROBOT_PATH_PORT = 8768    # Bridge → Robot (Path following)
 
 # Map parameters
-MAP_SIZE = 1880  # pixels
+MAP_SIZE = 200  # pixels
 MAP_RESOLUTION = 0.05  # meters per pixel
 MAP_ORIGIN_X = -MAP_SIZE * MAP_RESOLUTION / 2
 MAP_ORIGIN_Y = -MAP_SIZE * MAP_RESOLUTION / 2
@@ -49,7 +50,7 @@ MAX_LOG_ODDS = 3.0
 MIN_LOG_ODDS = -3.0
 OCCUPIED_THRESHOLD = 0.6
 
-LIDAR_OFFSET_X = 0.12   # e.g., 0.10 if LiDAR is 10 cm forward
+LIDAR_OFFSET_X = 0.0   # e.g., 0.10 if LiDAR is 10 cm forward
 LIDAR_OFFSET_Y = 0.0   # e.g., -0.05 if 5 cm to the right (negative = right)
 
 # Sensor parameters
@@ -77,7 +78,7 @@ ENABLE_SCAN_MATCHING = True
 # ============ Relay Configuration ============
 RELAY_URL = "wss://kmo-relayserver.yudhisthereal.workers.dev"
 BRIDGE_ID = "my_robot_01"                # Unique identifier for this robot
-BRIDGE_TOKEN = "kmo-bridge-token1"               # Must match relay's token
+BRIDGE_TOKEN = "kmo-bridge-token1"       # Must match relay's token
 RECONNECT_DELAY = 3.0                    # seconds
 MAX_RECONNECT_ATTEMPTS = 0               # 0 = infinite
 
@@ -143,7 +144,6 @@ def wrap_angle(angle):
     return angle
 
 
-
 print("=" * 60)
 print("UDP to WebSocket Bridge with Grid Map SLAM")
 print("Reverse WebSocket Relay Mode")
@@ -164,6 +164,7 @@ print("=" * 60)
 planner = None
 command_forwarder = None
 
+
 class OccupancyGrid:
     """2D occupancy grid map using log-odds with dynamic expansion"""
 
@@ -176,6 +177,7 @@ class OccupancyGrid:
         self.log_odds = np.zeros((height, width), dtype=np.float32)
         self.occupancy = np.full((height, width), -1, dtype=np.int8)
         self.last_update_packet_id = -1
+        self.map_update_id = 0  # incremented on each successful update
         # LiDAR mounting offset (in robot's local frame)
         self.lidar_offset_x = offset_x
         self.lidar_offset_y = offset_y
@@ -308,10 +310,10 @@ class OccupancyGrid:
         """Mark a cell and its 8 neighbors as occupied"""
         if not (0 <= gx < self.width and 0 <= gy < self.height):
             return
-        
+
         self.log_odds[gy, gx] += LOG_ODDS_OCCUPIED
         self.log_odds[gy, gx] = np.clip(self.log_odds[gy, gx], MIN_LOG_ODDS, MAX_LOG_ODDS)
-        
+
         for dx in [-1, 0, 1]:
             for dy in [-1, 0, 1]:
                 if dx == 0 and dy == 0:
@@ -328,9 +330,9 @@ class OccupancyGrid:
         """
         if packet_id <= self.last_update_packet_id:
             return False
-        
+
         self.last_update_packet_id = packet_id
-        
+
         for i in range(len(ranges)):
             r = ranges[i]
             angle = angles[i]
@@ -360,7 +362,8 @@ class OccupancyGrid:
             self.log_odds == 0, -1,
             np.where(prob > OCCUPIED_THRESHOLD, 100, 0)
         )
-        
+
+        self.map_update_id += 1
         return True
 
     def get_map(self):
@@ -372,13 +375,16 @@ class OccupancyGrid:
             "data": self.occupancy.flatten().tolist()
         }
 
+    def get_map_update_id(self):
+        return self.map_update_id
+
 
 class DedicatedCommandForwarder:
     """
     Dedicated command forwarder with separate ports for commands and paths.
     Uses non-blocking UDP sockets for immediate transmission.
     """
-    
+
     def __init__(self, cmd_port=ROBOT_CMD_PORT, path_port=ROBOT_PATH_PORT):
         self.cmd_port = cmd_port
         self.path_port = path_port
@@ -390,32 +396,32 @@ class DedicatedCommandForwarder:
         self._cmd_socket = None
         self._path_socket = None
         self._lock = threading.Lock()
-        
+
     def start(self):
         """Start the command forwarder threads"""
         if self._cmd_thread is not None and self._cmd_thread.is_alive():
             return
-            
+
         self.stop_event.clear()
-        
+
         # Create dedicated UDP sockets for each channel
         self._cmd_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._cmd_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._cmd_socket.setblocking(False)
-        
+
         self._path_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._path_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._path_socket.setblocking(False)
-        
+
         # Start separate threads for commands and paths
         self._cmd_thread = threading.Thread(target=self._cmd_forward_loop, daemon=True)
         self._cmd_thread.start()
-        
+
         self._path_thread = threading.Thread(target=self._path_forward_loop, daemon=True)
         self._path_thread.start()
-        
-        print(f"[CommandForwarder] Started - CMD port: {self.cmd_port}, PATH port: {self.path_port}")
-        
+
+        # print(f"[CommandForwarder] Started - CMD port: {self.cmd_port}, PATH port: {self.path_port}")
+
     def stop(self):
         """Stop the command forwarder"""
         self.stop_event.set()
@@ -429,12 +435,12 @@ class DedicatedCommandForwarder:
         if self._path_socket:
             self._path_socket.close()
             self._path_socket = None
-        print("[CommandForwarder] Stopped")
-        
+        # print("[CommandForwarder] Stopped")
+
     def send_command(self, command_type: str, payload: Any, priority: int = 10, callback: Optional[callable] = None):
         """
         Send a command to the robot immediately.
-        
+
         Args:
             command_type: 'cmd', 'auto', 'path'
             payload: Command payload (string for 'cmd'/'auto', list for 'path')
@@ -448,26 +454,26 @@ class DedicatedCommandForwarder:
             payload=payload,
             callback=callback
         )
-        
+
         # Route to appropriate queue
         if command_type == 'path':
             self.path_queue.put((priority, time.time(), cmd))
             print(f"[CommandForwarder] Queued PATH with priority {priority} on PORT {self.path_port}")
         else:
             self.command_queue.put((priority, time.time(), cmd))
-            print(f"[CommandForwarder] Queued {command_type} with priority {priority} on PORT {self.cmd_port}")
-        
+            # print(f"[CommandForwarder] Queued {command_type} with priority {priority} on PORT {self.cmd_port}")
+
     def _cmd_forward_loop(self):
         """Forward commands on dedicated command port"""
-        print(f"[CommandForwarder] CMD thread started on port {self.cmd_port}")
-        
+        # print(f"[CommandForwarder] CMD thread started on port {self.cmd_port}")
+
         while not self.stop_event.is_set():
             try:
                 try:
                     _, _, cmd = self.command_queue.get(timeout=0.01)
                 except queue.Empty:
                     continue
-                
+
                 if cmd.command_type == 'cmd':
                     message = f"CMD:{cmd.payload}".encode('utf-8')
                     self._send_udp(self._cmd_socket, message, self.cmd_port)
@@ -477,29 +483,29 @@ class DedicatedCommandForwarder:
                     self._send_udp(self._cmd_socket, message, self.cmd_port)
                 else:
                     print(f"[CommandForwarder] Unknown command type in CMD queue: {cmd.command_type}")
-                    
+
                 if cmd.callback:
                     try:
                         cmd.callback(True)
                     except Exception as e:
                         print(f"[CommandForwarder] Callback error: {e}")
-                        
+
             except Exception as e:
                 print(f"[CommandForwarder] CMD thread error: {e}")
-                
-        print("[CommandForwarder] CMD thread stopped")
-        
+
+        # print("[CommandForwarder] CMD thread stopped")
+
     def _path_forward_loop(self):
         """Forward path commands on dedicated path port"""
         print(f"[CommandForwarder] PATH thread started on port {self.path_port}")
-        
+
         while not self.stop_event.is_set():
             try:
                 try:
                     _, _, cmd = self.path_queue.get(timeout=0.01)
                 except queue.Empty:
                     continue
-                
+
                 if cmd.command_type == 'path':
                     if isinstance(cmd.payload, list) and cmd.payload:
                         path_str = ';'.join([f"{p[0]:.3f},{p[1]:.3f}" for p in cmd.payload])
@@ -510,32 +516,28 @@ class DedicatedCommandForwarder:
                         print(f"[CommandForwarder] Invalid path payload: {cmd.payload}")
                 else:
                     print(f"[CommandForwarder] Unknown command type in PATH queue: {cmd.command_type}")
-                    
+
                 if cmd.callback:
                     try:
                         cmd.callback(True)
                     except Exception as e:
                         print(f"[CommandForwarder] Callback error: {e}")
-                        
+
             except Exception as e:
                 print(f"[CommandForwarder] PATH thread error: {e}")
-                
-        print("[CommandForwarder] PATH thread stopped")
-        
+
+        # print("[CommandForwarder] PATH thread stopped")
+
     def _send_udp(self, sock, message: bytes, port: int):
         """Send UDP message to robot (non-blocking)"""
         if not sock:
             print(f"[CommandForwarder] No UDP socket available for port {port}")
             return
-            
+
         try:
-            # Send to localhost on the specified port
             sock.sendto(message, ('127.0.0.1', port))
-            # print(f"[CommandForwarder] Sent to port {port}: {message[:50]}...")
         except BlockingIOError:
-            # Socket would block - this shouldn't happen with small messages
             print(f"[CommandForwarder] Socket would block on port {port}, retrying...")
-            # Try one more time in blocking mode
             try:
                 sock.setblocking(True)
                 sock.sendto(message, ('127.0.0.1', port))
@@ -545,19 +547,20 @@ class DedicatedCommandForwarder:
         except Exception as e:
             print(f"[CommandForwarder] UDP send error on port {port}: {e}")
 
+
 class AtomicSharedPacket:
     """Thread-safe container for the latest packet with generation counter"""
-    
+
     def __init__(self):
         self._packet: Optional[SimulationPacket] = None
         self._generation: int = 0
         self._lock = threading.Lock()
-    
+
     def update(self, packet: SimulationPacket):
         with self._lock:
             self._packet = packet
             self._generation += 1
-    
+
     def get_latest(self):
         with self._lock:
             if self._packet is None:
@@ -567,16 +570,16 @@ class AtomicSharedPacket:
 
 class AtomicSharedState:
     """Thread-safe container for the latest SLAM state"""
-    
+
     def __init__(self):
         self._state: Optional[SlamState] = None
         self._state_id: int = 0
         self._lock = threading.Lock()
-    
+
     def update(self, state: SlamState):
         with self._lock:
             self._state = state
-    
+
     def get_latest(self):
         with self._lock:
             return self._state
@@ -584,7 +587,7 @@ class AtomicSharedState:
 
 class SlamProcessor:
     """SLAM processor that consumes packets and produces pose estimates"""
-    
+
     def __init__(self, shared_packet: AtomicSharedPacket, shared_state: AtomicSharedState):
         self.shared_packet = shared_packet
         self.shared_state = shared_state
@@ -593,67 +596,67 @@ class SlamProcessor:
             offset_x=LIDAR_OFFSET_X,
             offset_y=LIDAR_OFFSET_Y
         )
-        
+
         self.last_generation = 0
-        
+
         self.slam_x = 0.0
         self.slam_y = 0.0
         self.slam_theta = 0.0
         self.slam_initialized = False
-        
+
         self.processed_count = 0
         self.state_id = 0
         self.skipped_count = 0
-    
+
     def process_loop(self, stop_event: threading.Event):
         """Main processing loop - runs in its own thread"""
-        print("[SLAM] Processor thread started")
-        
+        # print("[SLAM] Processor thread started")
+
         last_debug = time.time()
-        
+
         while not stop_event.is_set():
             packet, generation = self.shared_packet.get_latest()
-            
+
             if packet is None or generation == self.last_generation:
                 time.sleep(0.0001)
                 continue
-            
+
             self.last_generation = generation
             self.process_packet(packet)
-            
-            if time.time() - last_debug > 2.0 and self.processed_count > 0:
-                last_debug = time.time()
-                print(f"[SLAM] Processed {self.processed_count} scans, {self.skipped_count} skipped, "
-                      f"pose=({self.slam_x:.2f}, {self.slam_y:.2f}, {math.degrees(self.slam_theta):.1f}°), "
-                      f"last packet_id: {packet.packet_id}")
-    
+
+            # if time.time() - last_debug > 2.0 and self.processed_count > 0:
+            #     last_debug = time.time()
+            #     print(f"[SLAM] Processed {self.processed_count} scans, {self.skipped_count} skipped, "
+            #           f"pose=({self.slam_x:.2f}, {self.slam_y:.2f}, {math.degrees(self.slam_theta):.1f}°), "
+            #           f"last packet_id: {packet.packet_id}")
+
     def process_packet(self, packet: SimulationPacket):
         """Process a single packet and update SLAM state"""
         self.processed_count += 1
-        
+
         angular_vel_abs = abs(packet.angular_vel)
         is_rotating_fast = angular_vel_abs > ANGULAR_VEL_THRESHOLD
-        
+
         if is_rotating_fast:
             self.skipped_count += 1
-            if self.skipped_count % 100 == 0:
-                print(f"[SLAM] Skipping scan matching (angular_vel={angular_vel_abs:.3f} rad/s)")
-        
+            # if self.skipped_count % 100 == 0:
+            #     print(f"[SLAM] Skipping scan matching (angular_vel={angular_vel_abs:.3f} rad/s)")
+
         current_x = packet.robot_x
         current_y = -packet.robot_y if FLIP_ROBOT_Y_FROM_SIM else packet.robot_y
         current_theta = packet.robot_theta
         match_score = 0.0
-        
+
         if not is_rotating_fast and ENABLE_SCAN_MATCHING and self.map_grid.is_ready_for_scan_matching():
             refined_x, refined_y, refined_theta, match_score = self.map_grid.refine_pose(
                 current_x, current_y, current_theta, packet.ranges, packet.angles
             )
-            
+
             current_x = (1 - CORRECTION_WEIGHT) * current_x + CORRECTION_WEIGHT * refined_x
             current_y = (1 - CORRECTION_WEIGHT) * current_y + CORRECTION_WEIGHT * refined_y
             theta_diff = wrap_angle(refined_theta - current_theta)
             current_theta = wrap_angle(current_theta + CORRECTION_WEIGHT * 0.5 * theta_diff)
-        
+
         if not self.slam_initialized:
             self.slam_x = current_x
             self.slam_y = current_y
@@ -663,18 +666,18 @@ class SlamProcessor:
             self.slam_x = current_x
             self.slam_y = current_y
             self.slam_theta = current_theta
-        
+
         # --- LiDAR offset correction: compute LiDAR world position ---
         lidar_x = self.slam_x + LIDAR_OFFSET_X * math.cos(self.slam_theta) - LIDAR_OFFSET_Y * math.sin(self.slam_theta)
         lidar_y = self.slam_y + LIDAR_OFFSET_X * math.sin(self.slam_theta) + LIDAR_OFFSET_Y * math.cos(self.slam_theta)
-        
+
         map_updated = False
         if not is_rotating_fast:
             map_updated = self.map_grid.update(
                 lidar_x, lidar_y, self.slam_theta,
                 packet.ranges, packet.angles, packet.packet_id
             )
-        
+
         self.state_id += 1
         new_state = SlamState(
             state_id=self.state_id,
@@ -696,12 +699,15 @@ class SlamProcessor:
             angular_vel=packet.angular_vel,
             scan_matching_skipped=is_rotating_fast
         )
-        
+
         self.shared_state.update(new_state)
-    
+
     def get_map(self):
         """Get the current occupancy grid"""
         return self.map_grid.get_map()
+
+    def get_map_update_id(self):
+        return self.map_grid.get_map_update_id()
 
 
 def coarse_grid_from_map(map_data, coarse_factor=COARSE_FACTOR, robot_width=ROBOT_WIDTH):
@@ -726,7 +732,7 @@ def coarse_grid_from_map(map_data, coarse_factor=COARSE_FACTOR, robot_width=ROBO
     # Build coarse binary occupancy (1 = occupied, 0 = free)
     coarse = np.zeros((ch, cw), dtype=np.uint8)   # use uint8 for boolean ops
     for cy in range(ch):
-        for cx in range(ch):
+        for cx in range(cw):
             fx0 = cx * cf
             fy0 = cy * cf
             fx1 = min(width, fx0 + cf)
@@ -737,7 +743,6 @@ def coarse_grid_from_map(map_data, coarse_factor=COARSE_FACTOR, robot_width=ROBO
 
     # 2. Compute inflation radius in coarse cells
     robot_radius = robot_width / 2.0
-    # Number of coarse cells to inflate (at least 1)
     inflation_cells = max(1, int(robot_radius / cres))
 
     # 3. Dilate the coarse occupancy using 8‑connectivity
@@ -887,73 +892,250 @@ def astar_plan(coarse, start_xy, goal_xy):
 
 
 class PlannerWorker:
+    """
+    Planner that handles a sequence of waypoints.
+    Continuously replans the path from the robot to the current active waypoint
+    and sends the updated path to the robot.
+    """
+
     def __init__(self, slam_processor, shared_state, command_forwarder):
         self.slam_processor = slam_processor
         self.shared_state = shared_state
         self.command_forwarder = command_forwarder
-        self._goal = None
-        self.path = []
-        self.start_at_goal = None
         self.lock = threading.Lock()
+
+        # Waypoint management
+        self.waypoints = []                # list of (x, y)
+        self.current_wp_index = 0          # index into waypoints
+        self.loop_mode = False
+        self.finished = False              # set when all waypoints done (no loop)
+
+        # Path and goal
+        self.path = []
+        self._goal = None                  # current active goal (waypoint)
+
+        # Re-planning state
+        self.last_plan_time = 0
+        self.last_map_update_id = -1
+        self.replan_interval = 2.0         # seconds
+        self.start_x = 0.0
+        self.start_y = 0.0
+        self.returning_to_start = False
+
+        # For external requests (e.g., set_goal from relay)
         self.request_queue = deque()
+        
+    def get_remaining_waypoints(self):
+        with self.lock:
+            if self.finished or not self.waypoints or self.returning_to_start:
+                return []
+            return self.waypoints[self.current_wp_index:]
+
+    def set_waypoints(self, waypoints, loop=False):
+        with self.lock:
+            self.waypoints = waypoints[:]
+            self.loop_mode = loop
+            self.current_wp_index = 0
+            self.finished = False
+            self.returning_to_start = False
+            # Store current robot position as start
+            state = self.shared_state.get_latest()
+            if state:
+                self.start_x = state.x
+                self.start_y = state.y
+            else:
+                self.start_x = 0.0
+                self.start_y = 0.0
+            if self.waypoints:
+                self._goal = self.waypoints[0]
+                self.request_queue.append(('plan',))
+            else:
+                self._goal = None
+                self.path = []
+
+    def set_goal(self, x, y, loop=False):
+        """Convenience: set a single goal (clears waypoints)."""
+        print(f"[Planner] set_goal called with x={x}, y={y}, loop={loop}")
+        
+        with self.lock:
+            self.waypoints = [(x, y)]
+            self.loop_mode = loop
+            self.current_wp_index = 0
+            self.finished = False
+            self._goal = (x, y)
+            print(f"[Planner] Single goal set: {self._goal}")
+            self.request_queue.append(('plan',))
 
     def get_goal(self):
-        """Get the current goal"""
         with self.lock:
             return self._goal
-    
-    def set_goal(self, x, y):
-        """Set the goal by coordinates"""
-        with self.lock:
-            self._goal = (x, y)
-            self.request_queue.append((x, y))
-    
+
     def get_path(self):
-        """Get the current path"""
         with self.lock:
             return list(self.path)
 
+    def _advance_to_next_waypoint(self):
+        with self.lock:
+            if not self.waypoints:
+                return False
+
+            # If we are already returning to start, finishing that leg means we stop.
+            if self.returning_to_start:
+                self.finished = True
+                self._goal = None
+                self.returning_to_start = False
+                return False
+
+            # Normal waypoint advancement
+            if self.current_wp_index + 1 < len(self.waypoints):
+                self.current_wp_index += 1
+                self._goal = self.waypoints[self.current_wp_index]
+                return True
+            else:
+                # Reached the last waypoint
+                if self.loop_mode:
+                    # Return to start
+                    self.returning_to_start = True
+                    self._goal = (self.start_x, self.start_y)
+                    return True
+                else:
+                    self.finished = True
+                    self._goal = None
+                    return False
+
+    def trim_path(self, robot_x, robot_y):
+        """
+        Remove reached waypoints and advance to next goal if necessary.
+        Uses a local flag to avoid calling _advance_to_next_waypoint() while holding the lock.
+        """
+        need_advance = False
+
+        # Phase 1: inside lock – inspect and update shared state
+        with self.lock:
+            if not self.path or self.finished:
+                return
+
+            dx = self.path[0][0] - robot_x
+            dy = self.path[0][1] - robot_y
+            distance = math.hypot(dx, dy)
+
+            if distance < 0.2:   # threshold (meters)
+                print(f"[Planner] trim_path: Robot at ({robot_x:.3f},{robot_y:.3f}) is near waypoint ({self.path[0][0]:.3f},{self.path[0][1]:.3f}) (dist={distance:.3f})")
+                self.path.pop(0)
+                print(f"[Planner] Trimmed waypoint, remaining path length: {len(self.path)}")
+
+                # If the path is empty, we have reached the current goal waypoint
+                if not self.path:
+                    print(f"[Planner] Path is empty, current goal waypoint reached")
+                    need_advance = True   # local flag, no shared state
+
+        # Phase 2: outside the lock – act on the decision
+        if need_advance:
+            # _advance_to_next_waypoint() acquires its own lock; we are no longer holding it
+            has_next = self._advance_to_next_waypoint()
+
+            if has_next:
+                print(f"[Planner] Requesting new plan for next waypoint")
+                # Re‑acquire lock briefly to push the planning request (if not thread‑safe)
+                with self.lock:
+                    self.request_queue.append(('plan',))
+            else:
+                print(f"[Planner] No more waypoints – stopping robot")
+                self.command_forwarder.send_command('cmd', 'stop', priority=1)
+
+    def check_replan(self, robot_x, robot_y, map_update_id):
+        """
+        Called from the main loop to decide if we should re‑plan.
+        Returns True if a new plan was queued.
+        """
+        with self.lock:
+            if self.finished or self._goal is None:
+                if self.finished:
+                    print(f"[Planner] check_replan: Finished flag True, skipping")
+                elif self._goal is None:
+                    print(f"[Planner] check_replan: No goal set, skipping")
+                return False
+
+            # Force re‑plan if map changed or time elapsed
+            map_changed = map_update_id != self.last_map_update_id
+            time_elapsed = time.time() - self.last_plan_time > self.replan_interval
+            
+            if map_changed or time_elapsed:
+                print(f"[Planner] check_replan: Replan triggered (map_changed={map_changed}, time_elapsed={time_elapsed:.2f} > {self.replan_interval})")
+                # Also ensure we have a path or the path is empty
+                self.request_queue.append(('plan',))
+                self.last_map_update_id = map_update_id
+                self.last_plan_time = time.time()
+                return True
+        return False
+
     def planner_loop(self, stop_event: threading.Event):
-        """Main planning loop"""
+        """Main planning loop – processes planning requests."""
         print("[Planner] Thread started")
         while not stop_event.is_set():
-            # Check if we have a goal to process
-            goal = None
+            # Check for planning requests
+            plan_requested = False
             with self.lock:
                 if self.request_queue:
-                    goal = self.request_queue.popleft()
-            
-            if goal is None:
+                    self.request_queue.popleft()   # discard, just a trigger
+                    plan_requested = True
+                    print(f"[Planner] planner_loop: Planning request popped from queue")
+
+            if not plan_requested:
                 time.sleep(0.05)
                 continue
 
             # Get current robot pose
             slam_state = self.shared_state.get_latest()
             if slam_state is None:
+                print(f"[Planner] planner_loop: No SLAM state available yet, skipping")
                 continue
             sx = slam_state.x
             sy = slam_state.y
+            print(f"[Planner] planner_loop: Current robot pose: ({sx:.3f},{sy:.3f})")
 
-            self.start_at_goal = (sx, sy)
+            # Get the current goal
+            with self.lock:
+                goal = self._goal
+                if goal is None:
+                    print(f"[Planner] planner_loop: No goal set, skipping")
+                    continue
+                print(f"[Planner] planner_loop: Current goal: ({goal[0]:.3f},{goal[1]:.3f})")
 
-            # Get map and plan path
+            # Plan path from robot to goal
+            print(f"[Planner] planner_loop: Starting A* planning from ({sx:.3f},{sy:.3f}) to ({goal[0]:.3f},{goal[1]:.3f})")
             map_data = self.slam_processor.get_map()
             coarse = coarse_grid_from_map(map_data)
-            planned = astar_plan(coarse, (sx, sy), goal)
-
-            with self.lock:
-                self._goal = goal
-                self.path = planned
             
-            # Send path to robot IMMEDIATELY via dedicated path forwarder
+            if coarse is None:
+                print(f"[Planner] planner_loop: Coarse grid is None (no map data)")
+                continue
+                
+            planned = astar_plan(coarse, (sx, sy), goal)
+            
             if planned:
+                print(f"[Planner] planner_loop: A* found path with {len(planned)} points")
+                print(f"[Planner] planner_loop: Path first 5 points: {planned[:5]}")
+            else:
+                print(f"[Planner] planner_loop: A* found NO path to goal")
+            
+            with self.lock:
+                self.path = planned
+                self.last_plan_time = time.time()
+                print(f"[Planner] planner_loop: Stored new path with {len(self.path)} points")
+
+            # Send path to robot (enable auto mode first)
+            if planned:
+                print(f"[Planner] planner_loop: Sending AUTO mode command")
+                self.command_forwarder.send_command('auto', True, priority=2)
+                # Convert to robot frame (flip Y)
                 robot_path = [(x, -y) for x, y in planned]
+                print(f"[Planner] planner_loop: Sending PATH command with {len(robot_path)} points")
                 self.command_forwarder.send_command('path', robot_path, priority=5)
-                print(f"[Planner] Sending path with {len(planned)} points to robot on port {ROBOT_PATH_PORT}")
+                print(f"[Planner] Sent path with {len(planned)} points to goal ({goal[0]:.2f},{goal[1]:.2f})")
             else:
                 print(f"[Planner] No path found to goal ({goal[0]:.2f},{goal[1]:.2f})")
-                
-            print(f"[Planner] Planned path with {len(planned)} points to ({goal[0]:.2f},{goal[1]:.2f})")
+
             time.sleep(0.05)
 
 
@@ -963,25 +1145,25 @@ def udp_receiver(shared_packet: AtomicSharedPacket, stop_event: threading.Event)
     udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     udp_socket.bind(('0.0.0.0', ROBOT_DATA_PORT))
     udp_socket.settimeout(0.1)
-    
+
     packet_count = 0
     packet_id = 0
-    print(f"[Receiver] UDP thread started on port {ROBOT_DATA_PORT} (Robot→Bridge)")
-    
+    # print(f"[Receiver] UDP thread started on port {ROBOT_DATA_PORT} (Robot→Bridge)")
+
     while not stop_event.is_set():
         try:
             data, _ = udp_socket.recvfrom(65535)
-            
+
             try:
                 message = data.decode('utf-8')
                 scan_data = json.loads(message)
-                
+
                 if scan_data.get('type') == 'lidar_scan':
                     packet_id += 1
-                    
+
                     ranges = tuple(scan_data.get('ranges', []))
                     angles = tuple(scan_data.get('angles', []))
-                    
+
                     packet = SimulationPacket(
                         packet_id=packet_id,
                         timestamp=scan_data.get('timestamp', time.time()),
@@ -996,29 +1178,29 @@ def udp_receiver(shared_packet: AtomicSharedPacket, stop_event: threading.Event)
                         angular_vel=scan_data.get('angular_vel', 0),
                         auto_navigate=scan_data.get('auto_navigate', True)
                     )
-                    
+
                     shared_packet.update(packet)
                     packet_count += 1
-                    
-                    if packet_count % 100 == 0:
-                        print(f"[Receiver] {packet_count} packets received, last packet_id: {packet_id}")
-                        
+
+                    # if packet_count % 100 == 0:
+                        # print(f"[Receiver] {packet_count} packets received, last packet_id: {packet_id}")
+
             except json.JSONDecodeError as e:
                 print(f"[DEBUG] JSON decode error: {e}")
             except Exception as e:
                 print(f"[DEBUG] Error processing packet: {e}")
-                
+
         except socket.timeout:
             continue
         except Exception as e:
             print(f"[Receiver] UDP error: {e}")
-    
+
     udp_socket.close()
-    print(f"[Receiver] Stopped. Total packets: {packet_count}, last packet_id: {packet_id}")
+    # print(f"[Receiver] Stopped. Total packets: {packet_count}, last packet_id: {packet_id}")
 
 
 # ============================================================================
-# NEW: Relay WebSocket Client functions
+# Relay WebSocket Client functions
 # ============================================================================
 
 relay_ws = None
@@ -1032,17 +1214,12 @@ async def connect_to_relay():
     attempts = 0
     while True:
         try:
-            # For production with WSS, you may need SSL context
             ssl_context = ssl.create_default_context()
-            # If using self-signed cert, you can disable verification (not recommended)
-            # ssl_context.check_hostname = False
-            # ssl_context.verify_mode = ssl.CERT_NONE
 
             print(f"[Bridge] Connecting to relay at {RELAY_URL} ...")
             relay_ws = await websockets.connect(
                 RELAY_URL,
                 ssl=ssl_context,
-                # extra_headers={"Authorization": f"Bearer {BRIDGE_TOKEN}"}  # alternative
             )
             # Register
             register_msg = {
@@ -1051,16 +1228,14 @@ async def connect_to_relay():
                 "bridgeId": BRIDGE_ID,
                 "token": BRIDGE_TOKEN
             }
-            
+
             await relay_ws.send(json.dumps(register_msg))
-            # Wait for registration confirmation
             response = await relay_ws.recv()
             resp_data = json.loads(response)
             if resp_data.get("type") == "registered":
                 print(f"[Bridge] Registered with relay as {BRIDGE_ID}")
                 with relay_lock:
                     relay_connected = True
-                # Start listening for messages from relay
                 asyncio.create_task(relay_message_handler(relay_ws))
                 return
             else:
@@ -1072,7 +1247,6 @@ async def connect_to_relay():
             print(f"[Bridge] Connection error: {e}")
             with relay_lock:
                 relay_connected = False
-        # Reconnect delay
         attempts += 1
         if MAX_RECONNECT_ATTEMPTS > 0 and attempts >= MAX_RECONNECT_ATTEMPTS:
             print("[Bridge] Max reconnect attempts reached. Giving up.")
@@ -1099,14 +1273,14 @@ async def relay_message_handler(ws):
         with relay_lock:
             relay_connected = False
     finally:
-        # Reconnect if needed
         if not relay_connected:
             asyncio.create_task(connect_to_relay())
 
 
 async def process_relay_message(data):
     """Process command messages from the relay."""
-    # This is the same logic as the old handle_client, reused
+    print(f"[Bridge] process_relay_message: Received data: {data}")
+    
     if data.get('type') == 'command':
         cmd = data.get('command')
         print(f"[Bridge] Received command: {cmd}")
@@ -1131,6 +1305,27 @@ async def process_relay_message(data):
         print(f"[Bridge] Goal set: ({gx:.2f},{gy:.2f})")
         planner.set_goal(gx, gy)
 
+    elif data.get('type') == 'set_waypoints':
+        waypoints = data.get('waypoints', [])
+        loop = data.get('loop', False)
+        print(f"[Bridge] Received set_waypoints with {len(waypoints)} waypoints, loop={loop}")
+        print(f"[Bridge] Waypoints data: {waypoints}")
+        
+        if waypoints:
+            wp_list = [(p['x'], p['y']) for p in waypoints]
+            print(f"[Bridge] Converted to wp_list: {wp_list}")
+            print(f"[Bridge] Calling planner.set_waypoints with {len(wp_list)} waypoints")
+            planner.set_waypoints(wp_list, loop)
+        else:
+            print(f"[Bridge] Empty waypoints list received")
+
+    elif data.get('type') == 'set_loop':
+        loop = data.get('loop', False)
+        print(f"[Bridge] set_loop: Setting loop mode to {loop}")
+        with planner.lock:
+            planner.loop_mode = loop
+        print(f"[Bridge] Loop mode set to {loop}")
+
     elif data.get('type') == 'autonomy':
         auto = bool(data.get('auto_navigate', True))
         print(f"[Bridge] Autonomy set: {auto}")
@@ -1140,7 +1335,7 @@ async def process_relay_message(data):
 
 
 # ============================================================================
-# MODIFIED: Broadcaster – now sends to relay instead of serving clients
+# Broadcaster – sends data to relay
 # ============================================================================
 
 async def websocket_broadcaster(shared_state, slam_processor, planner, stop_event):
@@ -1154,23 +1349,18 @@ async def websocket_broadcaster(shared_state, slam_processor, planner, stop_even
     last_map_broadcast = 0
     last_sent_path_sig = None
 
-    # UDP socket for backup path sending (optional)
     udp_backup_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp_backup_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
     while not stop_event.is_set():
         now = time.time()
-        print("[Broadcaster] top of loop")   # confirm each iteration
 
         slam_state = shared_state.get_latest()
 
-        # Get the coarse grid for visualization
         coarse_grid = None
         if slam_processor and slam_processor.map_grid:
-            print("[Broadcaster] getting map...")
             map_data = slam_processor.get_map()
             if map_data:
-                print("[Broadcaster] building coarse grid...")
                 coarse = coarse_grid_from_map(map_data, COARSE_FACTOR)
                 if coarse:
                     coarse_grid = {
@@ -1181,12 +1371,10 @@ async def websocket_broadcaster(shared_state, slam_processor, planner, stop_even
                         'origin_y': coarse['origin_y'],
                         'data': coarse['data'].flatten().tolist() if isinstance(coarse['data'], np.ndarray) else coarse['data']
                     }
-            print("[Broadcaster] map done")
-        
+
         if slam_state and relay_connected and relay_ws and relay_ws.state == websockets.protocol.State.OPEN:
-            print("[Broadcaster] inside main send block")
             if now - last_pose_broadcast >= pose_interval:
-                print("[Broadcaster] building output_message...")
+                last_pose_broadcast = now
                 output_message = {
                     "type": "lidar_scan",
                     "timestamp": slam_state.timestamp,
@@ -1222,6 +1410,7 @@ async def websocket_broadcaster(shared_state, slam_processor, planner, stop_even
                 current_path = planner.get_path() if planner is not None else []
                 if current_path:
                     output_message['path'] = [{'x': p[0], 'y': p[1]} for p in current_path]
+                    # print(f"[Broadcaster] Including path with {len(current_path)} points in output")
 
                 if planner.get_goal():
                     output_message["goal"] = {"x": planner.get_goal()[0], "y": planner.get_goal()[1]}
@@ -1234,19 +1423,20 @@ async def websocket_broadcaster(shared_state, slam_processor, planner, stop_even
                         try:
                             path_payload = 'PATH:' + ';'.join([f"{p[0]:.3f},{p[1]:.3f}" for p in current_path])
                             udp_backup_sock.sendto(path_payload.encode('utf-8'), ('127.0.0.1', ROBOT_CMD_PORT))
+                            print(f"[Broadcaster] Sent backup UDP path with {len(current_path)} points")
                         except Exception as e:
                             print(f"[Broadcaster] UDP backup send error: {e}")
+                
+                remaining_wp = planner.get_remaining_waypoints() if planner is not None else []
+                if remaining_wp:
+                    output_message["remaining_waypoints"] = [{"x": wp[0], "y": wp[1]} for wp in remaining_wp]
 
-                # Send to relay with a timeout to avoid indefinite blocking
+                # Send to relay
                 try:
-                    print(f"[Broadcaster] Sending to relay: {output_message.get('type')}, "
-                          f"pose=({slam_state.x:.2f},{slam_state.y:.2f}), "
-                          f"num_ranges={len(slam_state.ranges)}")
                     await asyncio.wait_for(
                         relay_ws.send(json.dumps(output_message)),
                         timeout=5.0
                     )
-                    print("[Broadcaster] Send successful")
                 except asyncio.TimeoutError:
                     print("[Broadcaster] Send timed out - relay may be unresponsive")
                     with relay_lock:
@@ -1259,11 +1449,11 @@ async def websocket_broadcaster(shared_state, slam_processor, planner, stop_even
         await asyncio.sleep(0.001)
 
     udp_backup_sock.close()
-    print("[Broadcaster] Stopped")
+    # print("[Broadcaster] Stopped")
 
 
 # ============================================================================
-# MODIFIED: main
+# main
 # ============================================================================
 
 async def main():
@@ -1271,8 +1461,7 @@ async def main():
     shared_packet = AtomicSharedPacket()
     shared_state = AtomicSharedState()
     stop_event = threading.Event()
-    
-    # Create command forwarder with dedicated ports
+
     command_forwarder = DedicatedCommandForwarder(
         cmd_port=ROBOT_CMD_PORT,
         path_port=ROBOT_PATH_PORT
@@ -1294,15 +1483,21 @@ async def main():
     # Connect to relay
     await connect_to_relay()
 
-    # Start broadcaster (sends to relay)
+    # Start broadcaster
     broadcaster_task = asyncio.create_task(
         websocket_broadcaster(shared_state, slam_processor, planner, stop_event)
     )
 
+    # Main loop: trim path and check for replan
     try:
-        # Keep running until stopped
         while not stop_event.is_set():
-            await asyncio.sleep(1)
+            slam_state = shared_state.get_latest()
+            if slam_state and planner:
+                # print(f"[Main] Trimming path at robot pose ({slam_state.x:.3f},{slam_state.y:.3f})")
+                planner.trim_path(slam_state.x, slam_state.y)
+                map_update_id = slam_processor.get_map_update_id()
+                planner.check_replan(slam_state.x, slam_state.y, map_update_id)
+            await asyncio.sleep(0.05)   # check every 50 ms
     except KeyboardInterrupt:
         print("\n[Main] Shutting down...")
     finally:

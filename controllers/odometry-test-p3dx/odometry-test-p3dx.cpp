@@ -25,7 +25,7 @@ using namespace webots;
 using namespace std;
 
 const int STARTUP_STEPS = 100;          // number of initial steps to wait
-const double ROBOT_WIDTH = 0.35;        // meters, width of P3DX
+const double ROBOT_WIDTH = 0.2;        // meters, width of P3DX
 
 class UDPBroadcaster
 {
@@ -439,7 +439,7 @@ int main(int argc, char **argv)
 
     while (robot->step(timeStep) != -1)
     {
-        double obstacleDistThres = autoMode ? 1.0 : 0.5;
+        double obstacleDistThres = autoMode ? 0.3 : 0.15;
         stepCounter++;   // increment each simulation step
 
         // --- If we haven't reached startup steps, do nothing---
@@ -576,8 +576,8 @@ int main(int argc, char **argv)
             case Keyboard::UP:
                 if (!autoMode)
                 {
-                    targetLeftSpeed = -maxSpeed;
-                    targetRightSpeed = -maxSpeed;
+                    targetLeftSpeed = maxSpeed;
+                    targetRightSpeed = maxSpeed;
                     smoother.setTarget(targetLeftSpeed, targetRightSpeed);
                     cout << "[Forward] Speed: " << maxSpeed << " rad/s" << endl;
                 }
@@ -586,8 +586,8 @@ int main(int argc, char **argv)
             case Keyboard::DOWN:
                 if (!autoMode)
                 {
-                    targetLeftSpeed = maxSpeed;
-                    targetRightSpeed = maxSpeed;
+                    targetLeftSpeed = -maxSpeed;
+                    targetRightSpeed = -maxSpeed;
                     smoother.setTarget(targetLeftSpeed, targetRightSpeed);
                     cout << "[Backward] Speed: " << maxSpeed << " rad/s" << endl;
                 }
@@ -673,15 +673,15 @@ int main(int argc, char **argv)
                         cout << "[Command] Executing: " << cmd << endl;
                         if (cmd == "forward")
                         {
-                            targetLeftSpeed = -maxSpeed;
-                            targetRightSpeed = -maxSpeed;
+                            targetLeftSpeed = maxSpeed;
+                            targetRightSpeed = maxSpeed;
                             smoother.setTarget(targetLeftSpeed, targetRightSpeed);
                             cout << "[DEBUG] Set speeds to forward: " << targetLeftSpeed << ", " << targetRightSpeed << endl;
                         }
                         else if (cmd == "backward")
                         {
-                            targetLeftSpeed = maxSpeed;
-                            targetRightSpeed = maxSpeed;
+                            targetLeftSpeed = -maxSpeed;
+                            targetRightSpeed = -maxSpeed;
                             smoother.setTarget(targetLeftSpeed, targetRightSpeed);
                             cout << "[DEBUG] Set speeds to backward: " << targetLeftSpeed << ", " << targetRightSpeed << endl;
                         }
@@ -849,7 +849,7 @@ int main(int argc, char **argv)
             double turnSpeed = maxSpeed * 0.35;
             
             bool isLastWaypoint = (pathIndex == pathPoints.size() - 1);
-            double stopThreshold = isLastWaypoint ? 0.30 : 0.12;
+            double stopThreshold = 0.12;
 
             if (dist < stopThreshold)
             {
@@ -1002,30 +1002,6 @@ int main(int argc, char **argv)
                 }
             }
         }
-
-        // Send robot info every 2 seconds
-        // if (iteration % (int)(2000 / timeStep) == 0 && iteration > 0)
-        // {
-        //     double robotX = odom.getX();
-        //     double robotY = odom.getY();
-        //     double robotTheta = odom.getTheta();
-        //     double linearVel = odom.getLinearVel();
-        //     double angularVel = odom.getAngularVel();
-
-        //     stringstream info;
-        //     info << fixed << setprecision(3);
-        //     info << "{\"type\":\"robot_info\",";
-        //     info << "\"timestamp\":" << currentTime << ",";
-        //     info << "\"left_speed\":" << smoother.getLeftSpeed() << ",";
-        //     info << "\"right_speed\":" << smoother.getRightSpeed() << ",";
-        //     info << "\"x\":" << robotX << ",";
-        //     info << "\"y\":" << robotY << ",";
-        //     info << "\"theta\":" << robotTheta << ",";
-        //     info << "\"linear_vel\":" << linearVel << ",";
-        //     info << "\"angular_vel\":" << angularVel << ",";
-        //     info << "\"auto_navigate\":" << (autoMode ? "true" : "false") << "}";
-        //     udp.send(info.str());
-        // }
 
         // Print pose at regular intervals
         if (iteration % printInterval == 0)
