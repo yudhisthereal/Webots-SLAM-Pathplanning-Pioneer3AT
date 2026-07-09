@@ -24,7 +24,8 @@
 using namespace webots;
 using namespace std;
 
-const int STARTUP_STEPS = 100;   // number of initial steps to wait
+const int STARTUP_STEPS = 100;          // number of initial steps to wait
+const double ROBOT_WIDTH = 0.35;        // meters, width of P3DX
 
 class UDPBroadcaster
 {
@@ -438,6 +439,7 @@ int main(int argc, char **argv)
 
     while (robot->step(timeStep) != -1)
     {
+        double obstacleDistThres = autoMode ? 1.0 : 0.5;
         stepCounter++;   // increment each simulation step
 
         // --- If we haven't reached startup steps, do nothing---
@@ -461,6 +463,57 @@ int main(int argc, char **argv)
 
         // Update odometry
         odom.update(leftPos, rightPos, currentTime);
+
+        // ========== OBSTACLE DETECTION ==========
+        bool obstacleAhead = false;
+        if (lidar != NULL)
+        {
+            if (isMultiLayer)
+            {
+                for (int layer = 0; layer < numberOfLayers; layer++)
+                {
+                    if (!useLayer[layer]) continue;
+                    const float *layerImage = lidar->getLayerRangeImage(layer);
+                    if (layerImage != NULL)
+                    {
+                        for (int i = 0; i < horizontalResolution; i += 1) // full resolution
+                        {
+                            float range = layerImage[i];
+                            if (range < minRange || range > maxRange || isnan(range)) continue;
+                            double angle = startAngle + i * angleStep;
+                            double x = range * cos(angle);
+                            double y = range * sin(angle);
+                            if (x > 0 && x < obstacleDistThres && fabs(y) < ROBOT_WIDTH / 2.0)
+                            {
+                                obstacleAhead = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (obstacleAhead) break;
+                }
+            }
+            else
+            {
+                const float *rangeImage = lidar->getRangeImage();
+                if (rangeImage != NULL)
+                {
+                    for (int i = 0; i < horizontalResolution; i += 1)
+                    {
+                        float range = rangeImage[i];
+                        if (range < minRange || range > maxRange || isnan(range)) continue;
+                        double angle = startAngle + i * angleStep;
+                        double x = range * cos(angle);
+                        double y = range * sin(angle);
+                        if (x > 0 && x < obstacleDistThres && fabs(y) < ROBOT_WIDTH / 2.0)
+                        {
+                            obstacleAhead = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
 
         // Handle keyboard input
         int key = keyboard->getKey();
@@ -602,7 +655,6 @@ int main(int argc, char **argv)
                 cmdBuffer[r] = '\0';
                 std::string msg(cmdBuffer);
 
-                // Remove trailing newline
                 while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r'))
                 {
                     msg.pop_back();
@@ -656,7 +708,6 @@ int main(int argc, char **argv)
                         }
                         else if (cmd == "auto")
                         {
-                            // Toggle auto mode via command
                             autoMode = !autoMode;
                             cout << "[DEBUG] Toggled auto mode to: " << (autoMode ? "true" : "false") << endl;
                             if (autoMode)
@@ -737,7 +788,6 @@ int main(int argc, char **argv)
                 if (msg.rfind("PATH:", 0) == 0)
                 {
                     std::string body = msg.substr(5);
-                    // Process path similarly as before
                     pathPoints.clear();
                     pathIndex = 0;
                     pathActive = false;
@@ -771,8 +821,19 @@ int main(int argc, char **argv)
             }
         }
 
-        // Autonomous path following
-        if (autoMode && pathActive && !pathPoints.empty() && pathIndex < pathPoints.size())
+        // ========== OBSTACLE STOP (active in ALL modes) ==========
+        if (obstacleAhead)
+        {
+            static int obstacleMsgCounter = 0;
+            if (++obstacleMsgCounter % 10 == 0)
+            {
+                cout << "[Obstacle] Obstacle detected ahead! Stopping." << endl;
+            }
+            targetLeftSpeed = 0.0;
+            targetRightSpeed = 0.0;
+            smoother.setTarget(0.0, 0.0);
+        }
+        else if (autoMode && pathActive && !pathPoints.empty() && pathIndex < pathPoints.size())
         {
             double tx = pathPoints[pathIndex].first;
             double ty = pathPoints[pathIndex].second;
@@ -788,11 +849,7 @@ int main(int argc, char **argv)
             double turnSpeed = maxSpeed * 0.35;
             
             bool isLastWaypoint = (pathIndex == pathPoints.size() - 1);
-
-            // --- Use a bigger stop radius for the final goal ---
-            double stopThreshold = isLastWaypoint ? 0.30 : 0.12;  // 30cm for final stop
-
-            cout << dist << endl;
+            double stopThreshold = isLastWaypoint ? 0.30 : 0.12;
 
             if (dist < stopThreshold)
             {
@@ -813,7 +870,6 @@ int main(int argc, char **argv)
             }
             else if (fabs(diff) > turnThresh)
             {
-                // Rotate in place
                 if (diff > 0)
                 {
                     targetLeftSpeed = -turnSpeed;
@@ -828,20 +884,16 @@ int main(int argc, char **argv)
             }
             else
             {
-                // Move forward
                 double speed = maxSpeed * 0.9;
-
-                // --- Gradual braking when approaching the final goal ---
                 if (isLastWaypoint)
                 {
-                    double brakingZone = 1.2;          // start slowing 1.2m away
+                    double brakingZone = 1.2;
                     if (dist < brakingZone)
                     {
                         speed = speed * (dist / brakingZone);
-                        if (speed < 0.08) speed = 0.08;  // crawl at very low speed
+                        if (speed < 0.08) speed = 0.08;
                     }
                 }
-
                 targetLeftSpeed = speed;
                 targetRightSpeed = speed;
                 smoother.setTarget(targetLeftSpeed, targetRightSpeed);
@@ -952,37 +1004,34 @@ int main(int argc, char **argv)
         }
 
         // Send robot info every 2 seconds
-        if (iteration % (int)(2000 / timeStep) == 0 && iteration > 0)
-        {
-            double robotX = odom.getX();
-            double robotY = odom.getY();
-            double robotTheta = odom.getTheta();
-            double linearVel = odom.getLinearVel();
-            double angularVel = odom.getAngularVel();
+        // if (iteration % (int)(2000 / timeStep) == 0 && iteration > 0)
+        // {
+        //     double robotX = odom.getX();
+        //     double robotY = odom.getY();
+        //     double robotTheta = odom.getTheta();
+        //     double linearVel = odom.getLinearVel();
+        //     double angularVel = odom.getAngularVel();
 
-            stringstream info;
-            info << fixed << setprecision(3);
-            info << "{\"type\":\"robot_info\",";
-            info << "\"timestamp\":" << currentTime << ",";
-            info << "\"left_speed\":" << smoother.getLeftSpeed() << ",";
-            info << "\"right_speed\":" << smoother.getRightSpeed() << ",";
-            info << "\"x\":" << robotX << ",";
-            info << "\"y\":" << robotY << ",";
-            info << "\"theta\":" << robotTheta << ",";
-            info << "\"linear_vel\":" << linearVel << ",";
-            info << "\"angular_vel\":" << angularVel << ",";
-            info << "\"auto_navigate\":" << (autoMode ? "true" : "false") << "}";
-            udp.send(info.str());
-
-            // cout << "[Robot] t=" << currentTime << "s, pos=(" << robotX << "," << robotY << "," << robotTheta << "), auto=" << autoMode << endl;
-        }
+        //     stringstream info;
+        //     info << fixed << setprecision(3);
+        //     info << "{\"type\":\"robot_info\",";
+        //     info << "\"timestamp\":" << currentTime << ",";
+        //     info << "\"left_speed\":" << smoother.getLeftSpeed() << ",";
+        //     info << "\"right_speed\":" << smoother.getRightSpeed() << ",";
+        //     info << "\"x\":" << robotX << ",";
+        //     info << "\"y\":" << robotY << ",";
+        //     info << "\"theta\":" << robotTheta << ",";
+        //     info << "\"linear_vel\":" << linearVel << ",";
+        //     info << "\"angular_vel\":" << angularVel << ",";
+        //     info << "\"auto_navigate\":" << (autoMode ? "true" : "false") << "}";
+        //     udp.send(info.str());
+        // }
 
         // Print pose at regular intervals
         if (iteration % printInterval == 0)
         {
             if (smoother.isMoving())
             {
-                // cout << "t=" << fixed << setprecision(2) << currentTime << "s | ";
                 odom.printPose();
             }
         }

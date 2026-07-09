@@ -2,7 +2,7 @@
 """
 UDP to WebSocket Bridge with Grid Map SLAM
 Clean architecture with atomic shared state and generation counters
-Maintains compatibility with existing web client
+Modified to use a reverse WebSocket connection to a relay server.
 """
 
 import asyncio
@@ -15,6 +15,7 @@ import time
 import threading
 import heapq
 import queue
+import ssl
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Any
@@ -22,7 +23,7 @@ from scipy.ndimage import binary_dilation, generate_binary_structure
 
 # ============ Configuration ============
 UDP_PORT = 8765
-WEBSOCKET_PORT = 8766
+WEBSOCKET_PORT = 8766  # no longer used as server, kept for reference
 BROADCAST_POSE_HZ = 30  # 30 Hz pose updates
 BROADCAST_MAP_HZ = 1    # 1 Hz map updates
 
@@ -72,6 +73,15 @@ FLIP_ROBOT_Y_FROM_SIM = True
 # Correction settings
 CORRECTION_WEIGHT = 0.05
 ENABLE_SCAN_MATCHING = True
+
+# ============ Relay Configuration ============
+RELAY_URL = "wss://kmo-relayserver.yudhisthereal.workers.dev"
+BRIDGE_ID = "my_robot_01"                # Unique identifier for this robot
+BRIDGE_TOKEN = "kmo-bridge-token1"               # Must match relay's token
+RECONNECT_DELAY = 3.0                    # seconds
+MAX_RECONNECT_ATTEMPTS = 0               # 0 = infinite
+
+# ============ End Configuration ============
 
 
 @dataclass(frozen=True)
@@ -133,21 +143,26 @@ def wrap_angle(angle):
     return angle
 
 
+
 print("=" * 60)
 print("UDP to WebSocket Bridge with Grid Map SLAM")
-print("Clean Architecture - Client Compatible")
+print("Reverse WebSocket Relay Mode")
 print("=" * 60)
 print(f"Map: {MAP_SIZE}x{MAP_SIZE} cells, {MAP_RESOLUTION*100:.0f}cm resolution")
 print(f"UDP Receive Port (Robot→Bridge): {ROBOT_DATA_PORT}")
-print(f"WebSocket Port: {WEBSOCKET_PORT}")
 print(f"UDP Command Port (Bridge→Robot): {ROBOT_CMD_PORT}")
 print(f"UDP Path Port (Bridge→Robot): {ROBOT_PATH_PORT}")
 print(f"Pose broadcast: {BROADCAST_POSE_HZ} Hz")
 print(f"Map broadcast: {BROADCAST_MAP_HZ} Hz")
 print(f"Correction Weight: {CORRECTION_WEIGHT * 100:.0f}%")
 print(f"Angular velocity threshold: {ANGULAR_VEL_THRESHOLD} rad/s ({ANGULAR_VEL_THRESHOLD * 180 / math.pi:.1f}°/s)")
+print(f"Relay URL: {RELAY_URL}")
+print(f"Bridge ID: {BRIDGE_ID}")
 print("=" * 60)
 
+
+planner = None
+command_forwarder = None
 
 class OccupancyGrid:
     """2D occupancy grid map using log-odds with dynamic expansion"""
@@ -357,6 +372,7 @@ class OccupancyGrid:
             "data": self.occupancy.flatten().tolist()
         }
 
+
 class DedicatedCommandForwarder:
     """
     Dedicated command forwarder with separate ports for commands and paths.
@@ -529,7 +545,6 @@ class DedicatedCommandForwarder:
         except Exception as e:
             print(f"[CommandForwarder] UDP send error on port {port}: {e}")
 
-
 class AtomicSharedPacket:
     """Thread-safe container for the latest packet with generation counter"""
     
@@ -687,6 +702,7 @@ class SlamProcessor:
     def get_map(self):
         """Get the current occupancy grid"""
         return self.map_grid.get_map()
+
 
 def coarse_grid_from_map(map_data, coarse_factor=COARSE_FACTOR, robot_width=ROBOT_WIDTH):
     """
@@ -1001,171 +1017,257 @@ def udp_receiver(shared_packet: AtomicSharedPacket, stop_event: threading.Event)
     print(f"[Receiver] Stopped. Total packets: {packet_count}, last packet_id: {packet_id}")
 
 
-async def websocket_broadcaster(shared_state: AtomicSharedState, slam_processor: SlamProcessor, 
-                                 planner: PlannerWorker, command_forwarder: DedicatedCommandForwarder,
-                                 stop_event: threading.Event):
-    """WebSocket broadcaster - sends pose at fixed rate, map at lower rate"""
-    
-    connected_clients = set()
-    
-    # UDP socket for sending path updates (for backwards compatibility)
+# ============================================================================
+# NEW: Relay WebSocket Client functions
+# ============================================================================
+
+relay_ws = None
+relay_connected = False
+relay_lock = threading.Lock()
+
+
+async def connect_to_relay():
+    """Connect to the relay server and register."""
+    global relay_ws, relay_connected
+    attempts = 0
+    while True:
+        try:
+            # For production with WSS, you may need SSL context
+            ssl_context = ssl.create_default_context()
+            # If using self-signed cert, you can disable verification (not recommended)
+            # ssl_context.check_hostname = False
+            # ssl_context.verify_mode = ssl.CERT_NONE
+
+            print(f"[Bridge] Connecting to relay at {RELAY_URL} ...")
+            relay_ws = await websockets.connect(
+                RELAY_URL,
+                ssl=ssl_context,
+                # extra_headers={"Authorization": f"Bearer {BRIDGE_TOKEN}"}  # alternative
+            )
+            # Register
+            register_msg = {
+                "type": "register",
+                "role": "bridge",
+                "bridgeId": BRIDGE_ID,
+                "token": BRIDGE_TOKEN
+            }
+            
+            await relay_ws.send(json.dumps(register_msg))
+            # Wait for registration confirmation
+            response = await relay_ws.recv()
+            resp_data = json.loads(response)
+            if resp_data.get("type") == "registered":
+                print(f"[Bridge] Registered with relay as {BRIDGE_ID}")
+                with relay_lock:
+                    relay_connected = True
+                # Start listening for messages from relay
+                asyncio.create_task(relay_message_handler(relay_ws))
+                return
+            else:
+                print(f"[Bridge] Registration failed: {response}")
+                await relay_ws.close()
+                with relay_lock:
+                    relay_connected = False
+        except Exception as e:
+            print(f"[Bridge] Connection error: {e}")
+            with relay_lock:
+                relay_connected = False
+        # Reconnect delay
+        attempts += 1
+        if MAX_RECONNECT_ATTEMPTS > 0 and attempts >= MAX_RECONNECT_ATTEMPTS:
+            print("[Bridge] Max reconnect attempts reached. Giving up.")
+            break
+        await asyncio.sleep(RECONNECT_DELAY)
+
+
+async def relay_message_handler(ws):
+    """Receive and process messages from relay (commands from browser)."""
+    global relay_connected
+    try:
+        async for message in ws:
+            try:
+                data = json.loads(message)
+                await process_relay_message(data)
+            except json.JSONDecodeError:
+                print(f"[Bridge] Invalid JSON from relay: {message}")
+    except websockets.exceptions.ConnectionClosed:
+        print("[Bridge] Relay connection closed")
+        with relay_lock:
+            relay_connected = False
+    except Exception as e:
+        print(f"[Bridge] Relay handler error: {e}")
+        with relay_lock:
+            relay_connected = False
+    finally:
+        # Reconnect if needed
+        if not relay_connected:
+            asyncio.create_task(connect_to_relay())
+
+
+async def process_relay_message(data):
+    """Process command messages from the relay."""
+    # This is the same logic as the old handle_client, reused
+    if data.get('type') == 'command':
+        cmd = data.get('command')
+        print(f"[Bridge] Received command: {cmd}")
+        if cmd == 'forward':
+            command_forwarder.send_command('cmd', 'forward', priority=3)
+        elif cmd == 'backward':
+            command_forwarder.send_command('cmd', 'backward', priority=3)
+        elif cmd == 'left':
+            command_forwarder.send_command('cmd', 'left', priority=3)
+        elif cmd == 'right':
+            command_forwarder.send_command('cmd', 'right', priority=3)
+        elif cmd == 'stop':
+            command_forwarder.send_command('cmd', 'stop', priority=1)
+        elif cmd == 'auto':
+            command_forwarder.send_command('cmd', 'auto', priority=2)
+        else:
+            command_forwarder.send_command('cmd', cmd, priority=10)
+
+    elif data.get('type') == 'set_goal':
+        gx = float(data.get('x', 0.0))
+        gy = float(data.get('y', 0.0))
+        print(f"[Bridge] Goal set: ({gx:.2f},{gy:.2f})")
+        planner.set_goal(gx, gy)
+
+    elif data.get('type') == 'autonomy':
+        auto = bool(data.get('auto_navigate', True))
+        print(f"[Bridge] Autonomy set: {auto}")
+        command_forwarder.send_command('auto', auto, priority=2)
+        if not auto:
+            command_forwarder.send_command('cmd', 'stop', priority=1)
+
+
+# ============================================================================
+# MODIFIED: Broadcaster – now sends to relay instead of serving clients
+# ============================================================================
+
+async def websocket_broadcaster(shared_state, slam_processor, planner, stop_event):
+    """Broadcast pose, map, and path data to the relay connection."""
+    global relay_ws, relay_connected
+
+    pose_interval = 1.0 / BROADCAST_POSE_HZ
+    map_interval = 1.0 / BROADCAST_MAP_HZ
+
+    last_pose_broadcast = 0
+    last_map_broadcast = 0
+    last_sent_path_sig = None
+
+    # UDP socket for backup path sending (optional)
     udp_backup_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp_backup_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    
-    async def handle_client(websocket):
-        print(f"[Broadcaster] Client connected from {websocket.remote_address}")
-        connected_clients.add(websocket)
-        try:
-            async for message in websocket:
-                try:
-                    data = json.loads(message)
-                    
-                    if data.get('type') == 'command':
-                        cmd = data.get('command')
-                        print(f"[Command] Received: {cmd}")
-                        
-                        # Send command IMMEDIATELY via dedicated command forwarder
-                        if cmd == 'forward':
-                            command_forwarder.send_command('cmd', 'forward', priority=3)
-                        elif cmd == 'backward':
-                            command_forwarder.send_command('cmd', 'backward', priority=3)
-                        elif cmd == 'left':
-                            command_forwarder.send_command('cmd', 'left', priority=3)
-                        elif cmd == 'right':
-                            command_forwarder.send_command('cmd', 'right', priority=3)
-                        elif cmd == 'stop':
-                            command_forwarder.send_command('cmd', 'stop', priority=1)  # High priority
-                        elif cmd == 'auto':
-                            # Toggle auto mode
-                            command_forwarder.send_command('cmd', 'auto', priority=2)
-                        else:
-                            # Unknown command - forward as-is
-                            command_forwarder.send_command('cmd', cmd, priority=10)
 
-                    elif data.get('type') == 'set_goal':
-                        gx = float(data.get('x', 0.0))
-                        gy = float(data.get('y', 0.0))
-                        print(f"[Broadcaster] Goal set by client: ({gx:.2f},{gy:.2f})")
-                        planner.set_goal(gx, gy)
+    while not stop_event.is_set():
+        now = time.time()
+        print("[Broadcaster] top of loop")   # confirm each iteration
 
-                    elif data.get('type') == 'autonomy':
-                        auto = bool(data.get('auto_navigate', True))
-                        print(f"[Broadcaster] Autonomy set: {auto}")
-                        # Send AUTO command IMMEDIATELY
-                        command_forwarder.send_command('auto', auto, priority=2)
-                        # Also send stop command when disabling auto
-                        if not auto:
-                            command_forwarder.send_command('cmd', 'stop', priority=1)
-                            
-                except json.JSONDecodeError as e:
-                    print(f"[Broadcaster] JSON parse error: {e}")
-                except Exception as e:
-                    print(f"[Broadcaster] Error handling message: {e}")
-        except websockets.exceptions.ConnectionClosed:
-            print(f"[Broadcaster] Client disconnected")
-        finally:
-            connected_clients.discard(websocket)
+        slam_state = shared_state.get_latest()
 
-    async with websockets.serve(handle_client, "0.0.0.0", WEBSOCKET_PORT):
-        print(f"[Broadcaster] WebSocket server on ws://0.0.0.0:{WEBSOCKET_PORT}")
-        
-        pose_interval = 1.0 / BROADCAST_POSE_HZ
-        map_interval = 1.0 / BROADCAST_MAP_HZ
-        
-        last_pose_broadcast = 0
-        last_map_broadcast = 0
-        last_sent_state_id = -1
-        last_sent_path_sig = None
-        
-        while not stop_event.is_set():
-            now = time.time()
-            
-            slam_state = shared_state.get_latest()
-            
-            # Get the coarse grid for visualization
-            coarse_grid = None
-            if slam_processor and slam_processor.map_grid:
-                map_data = slam_processor.get_map()
-                if map_data:
-                    coarse = coarse_grid_from_map(map_data, COARSE_FACTOR)
-                    if coarse:
-                        coarse_grid = {
-                            'width': coarse['width'],
-                            'height': coarse['height'],
-                            'resolution': coarse['resolution'],
-                            'origin_x': coarse['origin_x'],
-                            'origin_y': coarse['origin_y'],
-                            'data': coarse['data'].flatten().tolist() if isinstance(coarse['data'], np.ndarray) else coarse['data']
-                        }
-
-            
-            if slam_state and connected_clients:
-                if now - last_pose_broadcast >= pose_interval:
-                    last_pose_broadcast = now                    
-                    output_message = {
-                        "type": "lidar_scan",
-                        "timestamp": slam_state.timestamp,
-                        "num_points": len(slam_state.ranges),
-                        "min_range": MIN_RANGE,
-                        "max_range": MAX_RANGE,
-                        "fov": 6.283,
-                        "ranges": list(slam_state.ranges),
-                        "angles": list(slam_state.angles),
-                        "robot_x": slam_state.x,
-                        "robot_y": slam_state.y,
-                        "robot_theta": -slam_state.theta if FLIP_THETA_FOR_VISUALIZATION else slam_state.theta,
-                        "raw_robot_x": slam_state.raw_robot_x,
-                        "raw_robot_y": slam_state.raw_robot_y,
-                        "raw_robot_theta": -slam_state.raw_robot_theta if FLIP_THETA_FOR_VISUALIZATION else slam_state.raw_robot_theta,
-                        "pose_source": "slam",
-                        "left_speed": slam_state.left_speed,
-                        "right_speed": slam_state.right_speed,
-                        "auto_navigate": slam_state.auto_navigate,
-                        "linear_vel": slam_state.linear_vel,
-                        "angular_vel": slam_state.angular_vel,
-                        "slam_match_score": slam_state.match_score,
-                        "correction_weight": CORRECTION_WEIGHT if ENABLE_SCAN_MATCHING else 0.0,
-                        "scan_matching_skipped": slam_state.scan_matching_skipped,
+        # Get the coarse grid for visualization
+        coarse_grid = None
+        if slam_processor and slam_processor.map_grid:
+            print("[Broadcaster] getting map...")
+            map_data = slam_processor.get_map()
+            if map_data:
+                print("[Broadcaster] building coarse grid...")
+                coarse = coarse_grid_from_map(map_data, COARSE_FACTOR)
+                if coarse:
+                    coarse_grid = {
+                        'width': coarse['width'],
+                        'height': coarse['height'],
+                        'resolution': coarse['resolution'],
+                        'origin_x': coarse['origin_x'],
+                        'origin_y': coarse['origin_y'],
+                        'data': coarse['data'].flatten().tolist() if isinstance(coarse['data'], np.ndarray) else coarse['data']
                     }
-                    
-                    if now - last_map_broadcast >= map_interval:
-                        output_message["map"] = slam_processor.get_map()
-                        if coarse_grid:
-                            output_message["coarse_grid"] = coarse_grid
-                        last_map_broadcast = now
-
-                    current_path = planner.get_path() if planner is not None else []
-                    if current_path:
-                        output_message['path'] = [{'x': p[0], 'y': p[1]} for p in current_path]
-                    
-                    if planner.get_goal():
-                        output_message["goal"] = {"x": planner.get_goal()[0], "y": planner.get_goal()[1]}
-
-                    # Backup path send via UDP (for backwards compatibility)
-                    if current_path:
-                        sig = tuple((round(p[0],3), round(p[1],3)) for p in current_path)
-                        if sig != last_sent_path_sig:
-                            last_sent_path_sig = sig
-                            # This is a backup - the command forwarder already sent the path
-                            try:
-                                path_payload = 'PATH:' + ';'.join([f"{p[0]:.3f},{p[1]:.3f}" for p in current_path])
-                                udp_backup_sock.sendto(path_payload.encode('utf-8'), ('127.0.0.1', ROBOT_CMD_PORT))
-                            except Exception as e:
-                                print(f"[Broadcaster] UDP backup send error: {e}")
-                    
-                    payload = json.dumps(output_message)
-                    await asyncio.gather(*[client.send(payload) for client in connected_clients], return_exceptions=True)
-                    
-                    if slam_state.state_id != last_sent_state_id:
-                        last_sent_state_id = slam_state.state_id
-            
-            await asyncio.sleep(0.001)
+            print("[Broadcaster] map done")
         
-        udp_backup_sock.close()
-        print("[Broadcaster] Stopped")
+        if slam_state and relay_connected and relay_ws and relay_ws.state == websockets.protocol.State.OPEN:
+            print("[Broadcaster] inside main send block")
+            if now - last_pose_broadcast >= pose_interval:
+                print("[Broadcaster] building output_message...")
+                output_message = {
+                    "type": "lidar_scan",
+                    "timestamp": slam_state.timestamp,
+                    "num_points": len(slam_state.ranges),
+                    "min_range": MIN_RANGE,
+                    "max_range": MAX_RANGE,
+                    "fov": 6.283,
+                    "ranges": list(slam_state.ranges),
+                    "angles": list(slam_state.angles),
+                    "robot_x": slam_state.x,
+                    "robot_y": slam_state.y,
+                    "robot_theta": -slam_state.theta if FLIP_THETA_FOR_VISUALIZATION else slam_state.theta,
+                    "raw_robot_x": slam_state.raw_robot_x,
+                    "raw_robot_y": slam_state.raw_robot_y,
+                    "raw_robot_theta": -slam_state.raw_robot_theta if FLIP_THETA_FOR_VISUALIZATION else slam_state.raw_robot_theta,
+                    "pose_source": "slam",
+                    "left_speed": slam_state.left_speed,
+                    "right_speed": slam_state.right_speed,
+                    "auto_navigate": slam_state.auto_navigate,
+                    "linear_vel": slam_state.linear_vel,
+                    "angular_vel": slam_state.angular_vel,
+                    "slam_match_score": slam_state.match_score,
+                    "correction_weight": CORRECTION_WEIGHT if ENABLE_SCAN_MATCHING else 0.0,
+                    "scan_matching_skipped": slam_state.scan_matching_skipped,
+                }
 
+                if now - last_map_broadcast >= map_interval:
+                    output_message["map"] = slam_processor.get_map()
+                    if coarse_grid:
+                        output_message["coarse_grid"] = coarse_grid
+                    last_map_broadcast = now
+
+                current_path = planner.get_path() if planner is not None else []
+                if current_path:
+                    output_message['path'] = [{'x': p[0], 'y': p[1]} for p in current_path]
+
+                if planner.get_goal():
+                    output_message["goal"] = {"x": planner.get_goal()[0], "y": planner.get_goal()[1]}
+
+                # Backup path send via UDP
+                if current_path:
+                    sig = tuple((round(p[0],3), round(p[1],3)) for p in current_path)
+                    if sig != last_sent_path_sig:
+                        last_sent_path_sig = sig
+                        try:
+                            path_payload = 'PATH:' + ';'.join([f"{p[0]:.3f},{p[1]:.3f}" for p in current_path])
+                            udp_backup_sock.sendto(path_payload.encode('utf-8'), ('127.0.0.1', ROBOT_CMD_PORT))
+                        except Exception as e:
+                            print(f"[Broadcaster] UDP backup send error: {e}")
+
+                # Send to relay with a timeout to avoid indefinite blocking
+                try:
+                    print(f"[Broadcaster] Sending to relay: {output_message.get('type')}, "
+                          f"pose=({slam_state.x:.2f},{slam_state.y:.2f}), "
+                          f"num_ranges={len(slam_state.ranges)}")
+                    await asyncio.wait_for(
+                        relay_ws.send(json.dumps(output_message)),
+                        timeout=5.0
+                    )
+                    print("[Broadcaster] Send successful")
+                except asyncio.TimeoutError:
+                    print("[Broadcaster] Send timed out - relay may be unresponsive")
+                    with relay_lock:
+                        relay_connected = False
+                except Exception as e:
+                    print(f"[Broadcaster] Send error: {e}")
+                    with relay_lock:
+                        relay_connected = False
+
+        await asyncio.sleep(0.001)
+
+    udp_backup_sock.close()
+    print("[Broadcaster] Stopped")
+
+
+# ============================================================================
+# MODIFIED: main
+# ============================================================================
 
 async def main():
+    global planner, command_forwarder
     shared_packet = AtomicSharedPacket()
     shared_state = AtomicSharedState()
     stop_event = threading.Event()
@@ -1176,29 +1278,42 @@ async def main():
         path_port=ROBOT_PATH_PORT
     )
     command_forwarder.start()
-    
+
     slam_processor = SlamProcessor(shared_packet, shared_state)
-    
+
     udp_thread = threading.Thread(target=udp_receiver, args=(shared_packet, stop_event), daemon=True)
     udp_thread.start()
-    
+
     slam_thread = threading.Thread(target=slam_processor.process_loop, args=(stop_event,), daemon=True)
     slam_thread.start()
 
     planner = PlannerWorker(slam_processor, shared_state, command_forwarder)
     planner_thread = threading.Thread(target=planner.planner_loop, args=(stop_event,), daemon=True)
     planner_thread.start()
-    
+
+    # Connect to relay
+    await connect_to_relay()
+
+    # Start broadcaster (sends to relay)
+    broadcaster_task = asyncio.create_task(
+        websocket_broadcaster(shared_state, slam_processor, planner, stop_event)
+    )
+
     try:
-        await websocket_broadcaster(shared_state, slam_processor, planner, command_forwarder, stop_event)
+        # Keep running until stopped
+        while not stop_event.is_set():
+            await asyncio.sleep(1)
     except KeyboardInterrupt:
         print("\n[Main] Shutting down...")
     finally:
         stop_event.set()
+        broadcaster_task.cancel()
         command_forwarder.stop()
         udp_thread.join(timeout=2)
         slam_thread.join(timeout=2)
         planner_thread.join(timeout=1)
+        if relay_ws:
+            await relay_ws.close()
         print("[Main] Shutdown complete")
 
 
