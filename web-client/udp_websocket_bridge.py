@@ -458,7 +458,7 @@ class DedicatedCommandForwarder:
         # Route to appropriate queue
         if command_type == 'path':
             self.path_queue.put((priority, time.time(), cmd))
-            print(f"[CommandForwarder] Queued PATH with priority {priority} on PORT {self.path_port}")
+            # print(f"[CommandForwarder] Queued PATH with priority {priority} on PORT {self.path_port}")
         else:
             self.command_queue.put((priority, time.time(), cmd))
             # print(f"[CommandForwarder] Queued {command_type} with priority {priority} on PORT {self.cmd_port}")
@@ -511,7 +511,7 @@ class DedicatedCommandForwarder:
                         path_str = ';'.join([f"{p[0]:.3f},{p[1]:.3f}" for p in cmd.payload])
                         message = f"PATH:{path_str}".encode('utf-8')
                         self._send_udp(self._path_socket, message, self.path_port)
-                        print(f"[CommandForwarder] Sent PATH with {len(cmd.payload)} points on port {self.path_port}")
+                        # print(f"[CommandForwarder] Sent PATH with {len(cmd.payload)} points on port {self.path_port}")
                     else:
                         print(f"[CommandForwarder] Invalid path payload: {cmd.payload}")
                 else:
@@ -979,7 +979,7 @@ class PlannerWorker:
             if not self.waypoints:
                 return False
 
-            # If we are already returning to start, finishing that leg means we stop.
+            # If we are already returning to start, finishing that leg means stop.
             if self.returning_to_start:
                 self.finished = True
                 self._goal = None
@@ -992,55 +992,46 @@ class PlannerWorker:
                 self._goal = self.waypoints[self.current_wp_index]
                 return True
             else:
-                # Reached the last waypoint
+                print("ALL WAYPOINTS REACHED")
+                # Reached the last waypoint: advance index past the end
+                self.current_wp_index = len(self.waypoints)
                 if self.loop_mode:
-                    # Return to start
                     self.returning_to_start = True
                     self._goal = (self.start_x, self.start_y)
-                    return True
+                    return True          # new goal is the start position
                 else:
                     self.finished = True
                     self._goal = None
-                    return False
+                    return False         # no more goals
 
     def trim_path(self, robot_x, robot_y):
         """
-        Remove reached waypoints and advance to next goal if necessary.
-        Uses a local flag to avoid calling _advance_to_next_waypoint() while holding the lock.
+        Remove all reached waypoints from the front of the path.
+        If the path becomes empty, advance to the next waypoint (or stop).
         """
         need_advance = False
 
-        # Phase 1: inside lock – inspect and update shared state
         with self.lock:
             if not self.path or self.finished:
                 return
 
-            dx = self.path[0][0] - robot_x
-            dy = self.path[0][1] - robot_y
-            distance = math.hypot(dx, dy)
+            # Remove any number of consecutive path points that are within 0.2 m
+            while self.path and math.hypot(self.path[0][0] - robot_x, self.path[0][1] - robot_y) < 0.2:
+                _ = self.path.pop(0)
+                print("WAYPOINT REMOVED")
+                # Optional: print which point was removed
+                # print(f"[Planner] Removed waypoint ({removed[0]:.3f}, {removed[1]:.3f})")
 
-            if distance < 0.2:   # threshold (meters)
-                print(f"[Planner] trim_path: Robot at ({robot_x:.3f},{robot_y:.3f}) is near waypoint ({self.path[0][0]:.3f},{self.path[0][1]:.3f}) (dist={distance:.3f})")
-                self.path.pop(0)
-                print(f"[Planner] Trimmed waypoint, remaining path length: {len(self.path)}")
+            if not self.path:
+                need_advance = True
 
-                # If the path is empty, we have reached the current goal waypoint
-                if not self.path:
-                    print(f"[Planner] Path is empty, current goal waypoint reached")
-                    need_advance = True   # local flag, no shared state
-
-        # Phase 2: outside the lock – act on the decision
         if need_advance:
-            # _advance_to_next_waypoint() acquires its own lock; we are no longer holding it
             has_next = self._advance_to_next_waypoint()
-
             if has_next:
-                print(f"[Planner] Requesting new plan for next waypoint")
-                # Re‑acquire lock briefly to push the planning request (if not thread‑safe)
                 with self.lock:
                     self.request_queue.append(('plan',))
             else:
-                print(f"[Planner] No more waypoints – stopping robot")
+                # No more waypoints (and not returning to start) – stop robot
                 self.command_forwarder.send_command('cmd', 'stop', priority=1)
 
     def check_replan(self, robot_x, robot_y, map_update_id):
@@ -1050,10 +1041,10 @@ class PlannerWorker:
         """
         with self.lock:
             if self.finished or self._goal is None:
-                if self.finished:
-                    print(f"[Planner] check_replan: Finished flag True, skipping")
-                elif self._goal is None:
-                    print(f"[Planner] check_replan: No goal set, skipping")
+                # if self.finished:
+                #     print(f"[Planner] check_replan: Finished flag True, skipping")
+                # elif self._goal is None:
+                #     print(f"[Planner] check_replan: No goal set, skipping")
                 return False
 
             # Force re‑plan if map changed or time elapsed
@@ -1061,7 +1052,7 @@ class PlannerWorker:
             time_elapsed = time.time() - self.last_plan_time > self.replan_interval
             
             if map_changed or time_elapsed:
-                print(f"[Planner] check_replan: Replan triggered (map_changed={map_changed}, time_elapsed={time_elapsed:.2f} > {self.replan_interval})")
+                # print(f"[Planner] check_replan: Replan triggered (map_changed={map_changed}, time_elapsed={time_elapsed:.2f} > {self.replan_interval})")
                 # Also ensure we have a path or the path is empty
                 self.request_queue.append(('plan',))
                 self.last_map_update_id = map_update_id
@@ -1071,7 +1062,7 @@ class PlannerWorker:
 
     def planner_loop(self, stop_event: threading.Event):
         """Main planning loop – processes planning requests."""
-        print("[Planner] Thread started")
+        # print("[Planner] Thread started")
         while not stop_event.is_set():
             # Check for planning requests
             plan_requested = False
@@ -1079,7 +1070,7 @@ class PlannerWorker:
                 if self.request_queue:
                     self.request_queue.popleft()   # discard, just a trigger
                     plan_requested = True
-                    print(f"[Planner] planner_loop: Planning request popped from queue")
+                    # print(f"[Planner] planner_loop: Planning request popped from queue")
 
             if not plan_requested:
                 time.sleep(0.05)
@@ -1088,53 +1079,53 @@ class PlannerWorker:
             # Get current robot pose
             slam_state = self.shared_state.get_latest()
             if slam_state is None:
-                print(f"[Planner] planner_loop: No SLAM state available yet, skipping")
+                # print(f"[Planner] planner_loop: No SLAM state available yet, skipping")
                 continue
             sx = slam_state.x
             sy = slam_state.y
-            print(f"[Planner] planner_loop: Current robot pose: ({sx:.3f},{sy:.3f})")
+            # print(f"[Planner] planner_loop: Current robot pose: ({sx:.3f},{sy:.3f})")
 
             # Get the current goal
             with self.lock:
                 goal = self._goal
                 if goal is None:
-                    print(f"[Planner] planner_loop: No goal set, skipping")
+                    # print(f"[Planner] planner_loop: No goal set, skipping")
                     continue
-                print(f"[Planner] planner_loop: Current goal: ({goal[0]:.3f},{goal[1]:.3f})")
+                # print(f"[Planner] planner_loop: Current goal: ({goal[0]:.3f},{goal[1]:.3f})")
 
             # Plan path from robot to goal
-            print(f"[Planner] planner_loop: Starting A* planning from ({sx:.3f},{sy:.3f}) to ({goal[0]:.3f},{goal[1]:.3f})")
+            # print(f"[Planner] planner_loop: Starting A* planning from ({sx:.3f},{sy:.3f}) to ({goal[0]:.3f},{goal[1]:.3f})")
             map_data = self.slam_processor.get_map()
             coarse = coarse_grid_from_map(map_data)
             
             if coarse is None:
-                print(f"[Planner] planner_loop: Coarse grid is None (no map data)")
+                # print(f"[Planner] planner_loop: Coarse grid is None (no map data)")
                 continue
                 
             planned = astar_plan(coarse, (sx, sy), goal)
             
-            if planned:
-                print(f"[Planner] planner_loop: A* found path with {len(planned)} points")
-                print(f"[Planner] planner_loop: Path first 5 points: {planned[:5]}")
-            else:
-                print(f"[Planner] planner_loop: A* found NO path to goal")
+            # if planned:
+            #     print(f"[Planner] planner_loop: A* found path with {len(planned)} points")
+            #     print(f"[Planner] planner_loop: Path first 5 points: {planned[:5]}")
+            # else:
+            #     print(f"[Planner] planner_loop: A* found NO path to goal")
             
             with self.lock:
                 self.path = planned
                 self.last_plan_time = time.time()
-                print(f"[Planner] planner_loop: Stored new path with {len(self.path)} points")
+                # print(f"[Planner] planner_loop: Stored new path with {len(self.path)} points")
 
             # Send path to robot (enable auto mode first)
             if planned:
-                print(f"[Planner] planner_loop: Sending AUTO mode command")
+                # print(f"[Planner] planner_loop: Sending AUTO mode command")
                 self.command_forwarder.send_command('auto', True, priority=2)
                 # Convert to robot frame (flip Y)
                 robot_path = [(x, -y) for x, y in planned]
-                print(f"[Planner] planner_loop: Sending PATH command with {len(robot_path)} points")
+                # print(f"[Planner] planner_loop: Sending PATH command with {len(robot_path)} points")
                 self.command_forwarder.send_command('path', robot_path, priority=5)
-                print(f"[Planner] Sent path with {len(planned)} points to goal ({goal[0]:.2f},{goal[1]:.2f})")
-            else:
-                print(f"[Planner] No path found to goal ({goal[0]:.2f},{goal[1]:.2f})")
+                # print(f"[Planner] Sent path with {len(planned)} points to goal ({goal[0]:.2f},{goal[1]:.2f})")
+            # else:
+            #     print(f"[Planner] No path found to goal ({goal[0]:.2f},{goal[1]:.2f})")
 
             time.sleep(0.05)
 
@@ -1352,6 +1343,8 @@ async def websocket_broadcaster(shared_state, slam_processor, planner, stop_even
     udp_backup_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp_backup_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
+    prev_remaining_wp_len = 0
+
     while not stop_event.is_set():
         now = time.time()
 
@@ -1423,13 +1416,14 @@ async def websocket_broadcaster(shared_state, slam_processor, planner, stop_even
                         try:
                             path_payload = 'PATH:' + ';'.join([f"{p[0]:.3f},{p[1]:.3f}" for p in current_path])
                             udp_backup_sock.sendto(path_payload.encode('utf-8'), ('127.0.0.1', ROBOT_CMD_PORT))
-                            print(f"[Broadcaster] Sent backup UDP path with {len(current_path)} points")
+                            # print(f"[Broadcaster] Sent backup UDP path with {len(current_path)} points")
                         except Exception as e:
                             print(f"[Broadcaster] UDP backup send error: {e}")
                 
                 remaining_wp = planner.get_remaining_waypoints() if planner is not None else []
-                if remaining_wp:
+                if len(remaining_wp) != prev_remaining_wp_len:
                     output_message["remaining_waypoints"] = [{"x": wp[0], "y": wp[1]} for wp in remaining_wp]
+                prev_remaining_wp_len = len(remaining_wp)
 
                 # Send to relay
                 try:
