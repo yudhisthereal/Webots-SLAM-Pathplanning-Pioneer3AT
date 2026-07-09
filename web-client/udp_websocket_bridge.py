@@ -481,6 +481,9 @@ class DedicatedCommandForwarder:
                     value = "1" if cmd.payload else "0"
                     message = f"AUTO:{value}".encode('utf-8')
                     self._send_udp(self._cmd_socket, message, self.cmd_port)
+                elif cmd.command_type == 'speed':
+                    message = f"SPEED:{cmd.payload}".encode('utf-8')
+                    self._send_udp(self._cmd_socket, message, self.cmd_port)
                 else:
                     print(f"[CommandForwarder] Unknown command type in CMD queue: {cmd.command_type}")
 
@@ -1323,6 +1326,11 @@ async def process_relay_message(data):
         command_forwarder.send_command('auto', auto, priority=2)
         if not auto:
             command_forwarder.send_command('cmd', 'stop', priority=1)
+    elif data.get('type') == 'set_speed':
+        speed = float(data.get('speed', 4.0))
+        speed = max(0.1, min(10.0, speed))   # clamp
+        print(f"[Bridge] Setting max speed to {speed:.1f} rad/s")
+        command_forwarder.send_command('speed', speed, priority=5)
 
 
 # ============================================================================

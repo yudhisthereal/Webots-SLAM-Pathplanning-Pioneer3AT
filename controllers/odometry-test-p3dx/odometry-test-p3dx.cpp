@@ -24,8 +24,8 @@
 using namespace webots;
 using namespace std;
 
-const int STARTUP_STEPS = 100;          // number of initial steps to wait
-const double ROBOT_WIDTH = 0.2;        // meters, width of P3DX
+const int STARTUP_STEPS = 100;  // number of initial steps to wait
+const double ROBOT_WIDTH = 0.2; // meters, width of P3DX
 
 class UDPBroadcaster
 {
@@ -440,14 +440,14 @@ int main(int argc, char **argv)
     while (robot->step(timeStep) != -1)
     {
         double obstacleDistThres = autoMode ? 0.3 : 0.15;
-        stepCounter++;   // increment each simulation step
+        stepCounter++; // increment each simulation step
 
         // --- If we haven't reached startup steps, do nothing---
         if (stepCounter <= STARTUP_STEPS)
         {
-            continue;   // jump to next iteration
+            continue; // jump to next iteration
         }
-        else if (!processingStarted) 
+        else if (!processingStarted)
         {
             processingStarted = true;
             cout << "PROCESSING STARTED" << endl;
@@ -472,14 +472,16 @@ int main(int argc, char **argv)
             {
                 for (int layer = 0; layer < numberOfLayers; layer++)
                 {
-                    if (!useLayer[layer]) continue;
+                    if (!useLayer[layer])
+                        continue;
                     const float *layerImage = lidar->getLayerRangeImage(layer);
                     if (layerImage != NULL)
                     {
                         for (int i = 0; i < horizontalResolution; i += 1) // full resolution
                         {
                             float range = layerImage[i];
-                            if (range < minRange || range > maxRange || isnan(range)) continue;
+                            if (range < minRange || range > maxRange || isnan(range))
+                                continue;
                             double angle = startAngle + i * angleStep;
                             double x = range * cos(angle);
                             double y = range * sin(angle);
@@ -490,7 +492,8 @@ int main(int argc, char **argv)
                             }
                         }
                     }
-                    if (obstacleAhead) break;
+                    if (obstacleAhead)
+                        break;
                 }
             }
             else
@@ -501,7 +504,8 @@ int main(int argc, char **argv)
                     for (int i = 0; i < horizontalResolution; i += 1)
                     {
                         float range = rangeImage[i];
-                        if (range < minRange || range > maxRange || isnan(range)) continue;
+                        if (range < minRange || range > maxRange || isnan(range))
+                            continue;
                         double angle = startAngle + i * angleStep;
                         double x = range * cos(angle);
                         double y = range * sin(angle);
@@ -761,6 +765,21 @@ int main(int argc, char **argv)
                         }
                     }
                 }
+                else if (msg.rfind("SPEED:", 0) == 0)
+                {
+                    std::string speedStr = msg.substr(6);
+                    try
+                    {
+                        double newSpeed = std::stod(speedStr);
+                        newSpeed = std::max(0.1, std::min(10.0, newSpeed));
+                        maxSpeed = newSpeed;
+                        cout << "[Speed] Max speed set to " << fixed << setprecision(2) << maxSpeed << " rad/s" << endl;
+                    }
+                    catch (...)
+                    {
+                        cerr << "[Speed] Invalid value: " << speedStr << endl;
+                    }
+                }
                 else
                 {
                     cout << "[DEBUG] Unknown message type: " << msg.substr(0, msg.find(':')) << endl;
@@ -842,12 +861,14 @@ int main(int argc, char **argv)
             double dist = sqrt(dxp * dxp + dyp * dyp);
             double desired_heading = atan2(dyp, dxp);
             double diff = desired_heading - odom.getTheta();
-            while (diff > M_PI) diff -= 2 * M_PI;
-            while (diff < -M_PI) diff += 2 * M_PI;
+            while (diff > M_PI)
+                diff -= 2 * M_PI;
+            while (diff < -M_PI)
+                diff += 2 * M_PI;
 
             double turnThresh = 0.15;
             double turnSpeed = maxSpeed * 0.35;
-            
+
             bool isLastWaypoint = (pathIndex == pathPoints.size() - 1);
             double stopThreshold = 0.12;
 
@@ -891,7 +912,8 @@ int main(int argc, char **argv)
                     if (dist < brakingZone)
                     {
                         speed = speed * (dist / brakingZone);
-                        if (speed < 0.08) speed = 0.08;
+                        if (speed < 0.08)
+                            speed = 0.08;
                     }
                 }
                 targetLeftSpeed = speed;
