@@ -12,3 +12,5 @@ python-dateutil==2.9.0.post0
 scipy==1.17.1
 six==1.17.0
 websockets==16.0
+pyserial==3.5
+rplidar-roboticia==0.9.5

@@ -32,8 +32,8 @@ EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/project
 WorldInfo {
 }
 Viewpoint {
-  orientation 0.7062230459006614 0.0008001935118925611 -0.7079889611633334 3.1399844700535233
-  position -1.1210150952048474 -0.3891681225535915 33.530964222726375
+  orientation 0.3785398385405405 0.06737075921600881 -0.923129877883042 2.815906366262361
+  position -1.4723308722405628 4.199916113616126 2.6324701859838475
 }
 TexturedBackground {
 }
@@ -49,7 +49,7 @@ Pioneer3dx {
   controller "odometry-test-p3dx"
   extensionSlot [
     RpLidarA2 {
-      translation -0.01 -1.16758e-06 0.171
+      translation -0.01 -1.16758e-06 0.191
       rotation 0 0 1 -5.307179586466759e-06
       name "lidar"
     }
