@@ -50,9 +50,6 @@ MAX_LOG_ODDS = 3.0
 MIN_LOG_ODDS = -3.0
 OCCUPIED_THRESHOLD = 0.6
 
-LIDAR_OFFSET_X = 0.0   # e.g., 0.10 if LiDAR is 10 cm forward
-LIDAR_OFFSET_Y = 0.0   # e.g., -0.05 if 5 cm to the right (negative = right)
-
 # Sensor parameters
 MAX_RANGE = 12.0
 MIN_RANGE = 0.1
@@ -84,6 +81,51 @@ MAX_RECONNECT_ATTEMPTS = 0               # 0 = infinite
 
 # ============ End Configuration ============
 
+CONFIG_FILE = "robot_config.json"
+DEFAULT_CONFIG = {
+    "wheel_radius": 0.0975,
+    "wheel_base": 0.33,
+    "lidar_offset_x": 0.0,
+    "lidar_offset_y": 0.0,
+    "max_speed": 4.0,
+    "robot_width": 0.41,
+    "stop_distance": 0.3
+}
+
+robot_config = DEFAULT_CONFIG.copy()
+
+def load_config():
+    global robot_config
+    try:
+        with open(CONFIG_FILE, 'r') as f:
+            saved = json.load(f)
+            robot_config.update(saved)
+            print(f"[Config] Loaded from {CONFIG_FILE}")
+    except FileNotFoundError:
+        print(f"[Config] No config file found, using defaults")
+    except Exception as e:
+        print(f"[Config] Error loading config: {e}")
+
+def save_config():
+    try:
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(robot_config, f, indent=2)
+        print(f"[Config] Saved to {CONFIG_FILE}")
+    except Exception as e:
+        print(f"[Config] Error saving config: {e}")
+
+def send_config_to_robot():
+    global command_forwarder
+    """Send all robot‑relevant parameters via a single CONFIG command."""
+    config_str = (
+        f"{robot_config['wheel_radius']},"
+        f"{robot_config['wheel_base']},"
+        f"{robot_config['max_speed']},"
+        f"{robot_config['robot_width']},"
+        f"{robot_config['stop_distance']}"
+    )
+    command_forwarder.send_command('config', config_str, priority=5)
+    print(f"[Config] Sent to robot: {config_str}")
 
 @dataclass(frozen=True)
 class SimulationPacket:
@@ -592,12 +634,13 @@ class SlamProcessor:
     """SLAM processor that consumes packets and produces pose estimates"""
 
     def __init__(self, shared_packet: AtomicSharedPacket, shared_state: AtomicSharedState):
+        global robot_config
         self.shared_packet = shared_packet
         self.shared_state = shared_state
         self.map_grid = OccupancyGrid(
             MAP_SIZE, MAP_SIZE, MAP_RESOLUTION,
-            offset_x=LIDAR_OFFSET_X,
-            offset_y=LIDAR_OFFSET_Y
+            offset_x=robot_config.get("lidar_offset_x", 0.0),
+            offset_y=robot_config.get("lidar_offset_y", 0.0)
         )
 
         self.last_generation = 0
@@ -634,6 +677,7 @@ class SlamProcessor:
             #           f"last packet_id: {packet.packet_id}")
 
     def process_packet(self, packet: SimulationPacket):
+        global robot_config
         """Process a single packet and update SLAM state"""
         self.processed_count += 1
 
@@ -671,8 +715,10 @@ class SlamProcessor:
             self.slam_theta = current_theta
 
         # --- LiDAR offset correction: compute LiDAR world position ---
-        lidar_x = self.slam_x + LIDAR_OFFSET_X * math.cos(self.slam_theta) - LIDAR_OFFSET_Y * math.sin(self.slam_theta)
-        lidar_y = self.slam_y + LIDAR_OFFSET_X * math.sin(self.slam_theta) + LIDAR_OFFSET_Y * math.cos(self.slam_theta)
+        offset_x = robot_config.get("lidar_offset_x", 0.0)
+        offset_y = robot_config.get("lidar_offset_y", 0.0)
+        lidar_x = self.slam_x + offset_x * math.cos(self.slam_theta) - offset_y * math.sin(self.slam_theta)
+        lidar_y = self.slam_y + offset_x * math.sin(self.slam_theta) + offset_y * math.cos(self.slam_theta)
 
         map_updated = False
         if not is_rotating_fast:
@@ -713,13 +759,15 @@ class SlamProcessor:
         return self.map_grid.get_map_update_id()
 
 
-def coarse_grid_from_map(map_data, coarse_factor=COARSE_FACTOR, robot_width=ROBOT_WIDTH):
+def coarse_grid_from_map(map_data, coarse_factor=COARSE_FACTOR, robot_width=None):
     """
     Create a downsampled occupancy grid (coarse) and then inflate obstacles
     on that coarse grid by a number of coarse cells derived from robot radius.
     """
     if not map_data:
         return None
+    if robot_width is None:
+        robot_width = robot_config.get('robot_width', 0.41)
 
     width = map_data['width']
     height = map_data['height']
@@ -1099,7 +1147,8 @@ class PlannerWorker:
             # Plan path from robot to goal
             # print(f"[Planner] planner_loop: Starting A* planning from ({sx:.3f},{sy:.3f}) to ({goal[0]:.3f},{goal[1]:.3f})")
             map_data = self.slam_processor.get_map()
-            coarse = coarse_grid_from_map(map_data)
+            robot_width = robot_config.get('robot_width', 0.41)  # read global config
+            coarse = coarse_grid_from_map(map_data, COARSE_FACTOR, robot_width)
             
             if coarse is None:
                 # print(f"[Planner] planner_loop: Coarse grid is None (no map data)")
@@ -1331,6 +1380,27 @@ async def process_relay_message(data):
         speed = max(0.1, min(10.0, speed))   # clamp
         print(f"[Bridge] Setting max speed to {speed:.1f} rad/s")
         command_forwarder.send_command('speed', speed, priority=5)
+    elif data.get('type') == 'get_config':
+        # Send current config back to the requester
+        await relay_ws.send(json.dumps({
+            'type': 'config',
+            'config': robot_config
+        }))
+
+    elif data.get('type') == 'set_config':
+        new_config = data.get('config', {})
+        for key, value in new_config.items():
+            if key in robot_config:
+                robot_config[key] = value
+        save_config()
+        # Update bridge's own use of robot_width (for coarse grid inflation)
+        # (This will be used next time the planner plans)
+        # No need to do anything else – the planner reads robot_config directly.
+        send_config_to_robot()
+        await relay_ws.send(json.dumps({
+            'type': 'config_updated',
+            'config': robot_config
+        }))
 
 
 # ============================================================================
@@ -1362,7 +1432,8 @@ async def websocket_broadcaster(shared_state, slam_processor, planner, stop_even
         if slam_processor and slam_processor.map_grid:
             map_data = slam_processor.get_map()
             if map_data:
-                coarse = coarse_grid_from_map(map_data, COARSE_FACTOR)
+                robot_width = robot_config.get('robot_width', 0.41)
+                coarse = coarse_grid_from_map(map_data, COARSE_FACTOR, robot_width)
                 if coarse:
                     coarse_grid = {
                         'width': coarse['width'],
@@ -1489,6 +1560,8 @@ async def main():
     broadcaster_task = asyncio.create_task(
         websocket_broadcaster(shared_state, slam_processor, planner, stop_event)
     )
+    
+    load_config()
 
     # Main loop: trim path and check for replan
     try:

@@ -25,7 +25,6 @@ using namespace webots;
 using namespace std;
 
 const int STARTUP_STEPS = 100;  // number of initial steps to wait
-const double ROBOT_WIDTH = 0.2; // meters, width of P3DX
 
 class UDPBroadcaster
 {
@@ -94,6 +93,8 @@ private:
     bool firstUpdate = true;
 
 public:
+    void setWheelRadius(double r) { wheelRadius = std::max(0.01, r); }
+    void setWheelBase(double b) { wheelBase = std::max(0.01, b); }
     void update(double leftPos, double rightPos, double currentTime)
     {
         if (firstUpdate)
@@ -424,6 +425,9 @@ int main(int argc, char **argv)
     double targetLeftSpeed = 0.0;
     double targetRightSpeed = 0.0;
     double maxSpeed = 4.0;
+    double robotWidth = 0.41;
+    double obstacleDistThres = 0.3;
+
 
     int iteration = 0;
     int printInterval = 500 / timeStep;
@@ -439,7 +443,6 @@ int main(int argc, char **argv)
 
     while (robot->step(timeStep) != -1)
     {
-        double obstacleDistThres = autoMode ? 0.3 : 0.15;
         stepCounter++; // increment each simulation step
 
         // --- If we haven't reached startup steps, do nothing---
@@ -485,7 +488,7 @@ int main(int argc, char **argv)
                             double angle = startAngle + i * angleStep;
                             double x = range * cos(angle);
                             double y = range * sin(angle);
-                            if (x > 0 && x < obstacleDistThres && fabs(y) < ROBOT_WIDTH / 2.0)
+                            if (x > 0 && x < obstacleDistThres && fabs(y) < robotWidth / 2.0)
                             {
                                 obstacleAhead = true;
                                 break;
@@ -509,7 +512,7 @@ int main(int argc, char **argv)
                         double angle = startAngle + i * angleStep;
                         double x = range * cos(angle);
                         double y = range * sin(angle);
-                        if (x > 0 && x < obstacleDistThres && fabs(y) < ROBOT_WIDTH / 2.0)
+                        if (x > 0 && x < obstacleDistThres && fabs(y) < robotWidth / 2.0)
                         {
                             obstacleAhead = true;
                             break;
@@ -765,24 +768,37 @@ int main(int argc, char **argv)
                         }
                     }
                 }
-                else if (msg.rfind("SPEED:", 0) == 0)
+                else if (msg.rfind("CONFIG:", 0) == 0)
                 {
-                    std::string speedStr = msg.substr(6);
-                    try
+                    std::string body = msg.substr(7);
+                    std::stringstream ss(body);
+                    std::string token;
+                    std::vector<double> values;
+                    while (std::getline(ss, token, ','))
                     {
-                        double newSpeed = std::stod(speedStr);
-                        newSpeed = std::max(0.1, std::min(10.0, newSpeed));
-                        maxSpeed = newSpeed;
-                        cout << "[Speed] Max speed set to " << fixed << setprecision(2) << maxSpeed << " rad/s" << endl;
+                        try { values.push_back(std::stod(token)); }
+                        catch (...) { /* ignore */ }
                     }
-                    catch (...)
+                    if (values.size() >= 5)
                     {
-                        cerr << "[Speed] Invalid value: " << speedStr << endl;
+                        double newRadius = std::max(0.01, values[0]);
+                        double newBase = std::max(0.01, values[1]);
+                        double newMaxSpeed = std::max(0.1, std::min(10.0, values[2]));
+                        double newWidth = std::max(0.01, values[3]);
+                        double newStopDist = std::max(0.01, values[4]);
+                        odom.setWheelRadius(newRadius);
+                        odom.setWheelBase(newBase);
+                        maxSpeed = newMaxSpeed;
+                        robotWidth = newWidth;
+                        obstacleDistThres = newStopDist;
+                        cout << "[Config] Updated: radius=" << newRadius << ", base=" << newBase
+                            << ", maxSpeed=" << maxSpeed << ", width=" << robotWidth
+                            << ", stopDist=" << obstacleDistThres << endl;
                     }
-                }
-                else
-                {
-                    cout << "[DEBUG] Unknown message type: " << msg.substr(0, msg.find(':')) << endl;
+                    else
+                    {
+                        cerr << "[Config] Invalid format, need 5 values" << endl;
+                    }
                 }
             }
         }
