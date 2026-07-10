@@ -23,11 +23,11 @@ from scipy.ndimage import binary_dilation, generate_binary_structure
 from rplidar import RPLidar
 
 # ============ Configuration ============
-SERIAL_PORT = "COM6"
+SERIAL_PORT = "COM7"
 SERIAL_BAUDRATE = 115200
 SERIAL_TIMEOUT = 0.1
 
-LIDAR_PORT = 'COM8'
+LIDAR_PORT = 'COM6'
 LIDAR_BAUDRATE = 115200
 LIDAR_SCAN_TYPE = "normal"
 
@@ -93,6 +93,10 @@ relay_connected = False
 relay_lock = threading.Lock()
 slam_processor = None
 
+# ---- Robot physical dimensions ----
+ROBOT_LENGTH = 0.71       # meters
+ROBOT_HALF_WIDTH = 0.195  # 0.39/2
+
 # ============ Config ============
 def load_config():
     global robot_config
@@ -100,19 +104,22 @@ def load_config():
         with open(CONFIG_FILE, 'r') as f:
             saved = json.load(f)
             robot_config.update(saved)
-            print(f"[Config] Loaded from {CONFIG_FILE}")
+            # print(f"[Config] Loaded from {CONFIG_FILE}")
     except FileNotFoundError:
-        print("[Config] No config file, using defaults")
+        # print("[Config] No config file, using defaults")
+        pass
     except Exception as e:
-        print(f"[Config] Error: {e}")
+        # print(f"[Config] Error: {e}")
+        pass
 
 def save_config():
     try:
         with open(CONFIG_FILE, 'w') as f:
             json.dump(robot_config, f, indent=2)
-        print(f"[Config] Saved to {CONFIG_FILE}")
+        # print(f"[Config] Saved to {CONFIG_FILE}")
     except Exception as e:
-        print(f"[Config] Save error: {e}")
+        # print(f"[Config] Save error: {e}")
+        pass
 
 def send_config_to_robot():
     global command_forwarder
@@ -124,7 +131,7 @@ def send_config_to_robot():
         f"{robot_config['stop_distance']}"
     )
     command_forwarder.send_command('config', config_str, priority=5)
-    print(f"[Config] Sent to ESP32: {config_str}")
+    # print(f"[Config] Sent to ESP32: {config_str}")
 
 # ============ Data containers ============
 @dataclass(frozen=True)
@@ -468,7 +475,7 @@ class SlamProcessor:
         self.skipped_count = 0
         self.state_id = 0
         self.last_generation = 0   # important to prevent old packets from being processed
-        print("[SlamProcessor] Reset SLAM (map cleared, pose zeroed)")
+        # print("[SlamProcessor] Reset SLAM (map cleared, pose zeroed)")
 
     def get_map(self):
         return self.map_grid.get_map()
@@ -507,9 +514,9 @@ class SerialManager:
             self._ser = serial.Serial(self.port, self.baudrate, timeout=self.timeout)
             self._ser.flushInput()
             self._ser.flushOutput()
-            print(f"[SerialManager] Opened {self.port}")
+            # print(f"[SerialManager] Opened {self.port}")
         except Exception as e:
-            print(f"[SerialManager] Failed: {e}")
+            # print(f"[SerialManager] Failed: {e}")
             return False
         self._stop_event.clear()
         self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
@@ -533,7 +540,7 @@ class SerialManager:
                     self._commands_sent += 1
                     return True
                 except Exception as e:
-                    print(f"[SerialManager] Write error: {e}")
+                    # print(f"[SerialManager] Write error: {e}")
                     return False
             return False
 
@@ -573,7 +580,7 @@ class SerialManager:
                 else:
                     time.sleep(0.001)
             except Exception as e:
-                print(f"[SerialManager] Reader error: {e}")
+                # print(f"[SerialManager] Reader error: {e}")
                 time.sleep(0.1)
 
     def _parse_line(self, line):
@@ -599,8 +606,8 @@ class SerialManager:
                         self._last_odom_update = time.time()
             except Exception as e:
                 self._parse_errors += 1
-                if self._parse_errors % 10 == 0:
-                    print(f"[SerialManager] Parse error: {e}")
+                # if self._parse_errors % 10 == 0:
+                #     print(f"[SerialManager] Parse error: {e}")
 
 # ---------- SerialCommandForwarder ----------
 class SerialCommandForwarder:
@@ -616,7 +623,7 @@ class SerialCommandForwarder:
         self.stop_event.clear()
         self._thread = threading.Thread(target=self._forward_loop, daemon=True)
         self._thread.start()
-        print("[SerialCommandForwarder] Started")
+        # print("[SerialCommandForwarder] Started")
 
     def stop(self):
         self.stop_event.set()
@@ -657,6 +664,8 @@ class SerialCommandForwarder:
                 return None
         elif cmd_type == 'config':
             return f"CONFIG:{payload}"
+        elif cmd_type == 'obs':
+            return f"OBS:{payload}"
         else:
             return None
 
@@ -982,17 +991,24 @@ class PlannerWorker:
             time.sleep(0.05)
 
 # ---------- LiDAR receiver ----------
-def lidar_and_odom_receiver(shared_packet, stop_event, lidar_port, baudrate, scan_type, serial_manager):
+def lidar_and_odom_receiver(shared_packet, stop_event, lidar_port, baudrate, scan_type, serial_manager, command_forwarder):
+    """
+    LiDAR receiver thread:
+    - Accumulates scans
+    - Builds a SimulationPacket with odometry and scan data
+    - Updates shared_packet for SLAM
+    - Computes obstacle clearances (front, rear, left, right) and sends OBS: command to ESP32
+    """
     packet_count = 0
     packet_id = 0
 
     try:
-        lidar = RPLidar(lidar_port, baudrate=baudrate)
+        lidar = RPLidar(lidar_port, baudrate=baudrate, timeout=3)
         info = lidar.get_info()
-        print(f"[LiDAR] Connected! Model: {info.get('model', 'unknown')}, Firmware: {info.get('firmware', 'unknown')}")
+        # print(f"[LiDAR] Connected! Model: {info.get('model', 'unknown')}, Firmware: {info.get('firmware', 'unknown')}")
         scan_generator = lidar.iter_scans(scan_type=scan_type)
     except Exception as e:
-        print(f"[LiDAR] Failed to open LiDAR: {e}")
+        # print(f"[LiDAR] Failed to open LiDAR: {e}")
         return
 
     scan_counter = 0
@@ -1011,6 +1027,9 @@ def lidar_and_odom_receiver(shared_packet, stop_event, lidar_port, baudrate, sca
     MIN_ANGLE_COVERAGE = 350
     accumulated_angle_min = float('inf')
     accumulated_angle_max = -float('inf')
+
+    # For OBS throttling
+    last_obs_send = 0
 
     while not stop_event.is_set():
         try:
@@ -1031,8 +1050,8 @@ def lidar_and_odom_receiver(shared_packet, stop_event, lidar_port, baudrate, sca
                     ranges.append(distance / 1000.0)
                     angles.append(math.radians(angle))
 
-            if low_quality_count > 0:
-                print(f"[LiDAR WARNING] Scan #{scan_counter}: {low_quality_count} low quality points (quality < 15)")
+            # if low_quality_count > 0:
+            #     print(f"[LiDAR WARNING] Scan #{scan_counter}: {low_quality_count} low quality points (quality < 15)")
 
             if len(ranges) > 0:
                 if accumulated_timestamp is None:
@@ -1074,7 +1093,7 @@ def lidar_and_odom_receiver(shared_packet, stop_event, lidar_port, baudrate, sca
                     send_reason = f"many scans ({accumulated_scan_count}) with coverage {angle_coverage:.1f} deg"
 
                 if should_send:
-                    print(f"[LiDAR] Accumulated {len(accumulated_ranges)} points from {accumulated_scan_count} scans")
+                    # print(f"[LiDAR] Accumulated {len(accumulated_ranges)} points from {accumulated_scan_count} scans")
                     if serial_manager:
                         odom = serial_manager.get_latest_odometry()
                         robot_x = odom['robot_x']
@@ -1103,7 +1122,88 @@ def lidar_and_odom_receiver(shared_packet, stop_event, lidar_port, baudrate, sca
                     )
                     shared_packet.update(packet)
                     packet_count += 1
-                    print(f"[LiDAR] Packet #{packet_id} updated shared state: {len(accumulated_ranges)} points")
+                    # print(f"[LiDAR] Packet #{packet_id} updated shared state: {len(accumulated_ranges)} points")
+
+                    # ============= OBSTACLE CLEARANCE COMPUTATION (CORRECTED FOR REAR-MOUNTED LIDAR) =============
+                    # Throttle OBS sending to ~5 Hz
+                    now = time.time()
+                    if now - last_obs_send >= 0.2:
+                        # Initialize clearances to maximum
+                        front_clearance = float('inf')
+                        rear_clearance = float('inf')
+                        left_clearance = float('inf')
+                        right_clearance = float('inf')
+                        
+                        for r, angle in zip(accumulated_ranges, accumulated_angles):
+                            # Filter invalid measurements
+                            if r < MIN_RANGE or r > MAX_RANGE:
+                                continue
+                            
+                            # LiDAR angle is absolute (0° = forward, +left, -right in radians)
+                            # Normalize angle to [-pi, pi]
+                            normalized_angle = angle
+                            while normalized_angle > math.pi:
+                                normalized_angle -= 2 * math.pi
+                            while normalized_angle < -math.pi:
+                                normalized_angle += 2 * math.pi
+                            
+                            angle_deg = math.degrees(normalized_angle)
+                            
+                            # Front sector: -30° to +30°
+                            if abs(angle_deg) <= 30:
+                                # LiDAR at rear, so front of robot is ROBOT_LENGTH ahead
+                                # Clearance = distance * cos(angle) - ROBOT_LENGTH
+                                clearance = r * math.cos(normalized_angle) - ROBOT_LENGTH
+                                if clearance < front_clearance:
+                                    front_clearance = clearance
+                            
+                            # Rear sector: 180° ± 30° (150° to 210°)
+                            elif abs(abs(angle_deg) - 180) <= 30:
+                                # LiDAR at rear, so rear clearance is just the distance
+                                # Since LiDAR is at the back edge, no robot body to subtract
+                                clearance = r
+                                if clearance < rear_clearance:
+                                    rear_clearance = clearance
+                            
+                            # Left sector: +30° to +90°
+                            elif 30 <= angle_deg <= 90:
+                                # LiDAR at rear, left side clearance
+                                # Clearance = distance * sin(angle) - HALF_WIDTH
+                                clearance = r * math.sin(normalized_angle) - ROBOT_HALF_WIDTH
+                                if clearance < left_clearance:
+                                    left_clearance = clearance
+                            
+                            # Right sector: -90° to -30°
+                            elif -90 <= angle_deg <= -30:
+                                # LiDAR at rear, right side clearance
+                                # Clearance = distance * |sin(angle)| - HALF_WIDTH
+                                clearance = r * abs(math.sin(normalized_angle)) - ROBOT_HALF_WIDTH
+                                if clearance < right_clearance:
+                                    right_clearance = clearance
+                        
+                        # Set default if no points in sector (no obstacles detected)
+                        if front_clearance == float('inf'):
+                            front_clearance = MAX_RANGE
+                        if rear_clearance == float('inf'):
+                            rear_clearance = MAX_RANGE
+                        if left_clearance == float('inf'):
+                            left_clearance = MAX_RANGE
+                        if right_clearance == float('inf'):
+                            right_clearance = MAX_RANGE
+                        
+                        # Ensure non-negative values
+                        front_clearance = max(0.0, front_clearance)
+                        rear_clearance = max(0.0, rear_clearance)
+                        left_clearance = max(0.0, left_clearance)
+                        right_clearance = max(0.0, right_clearance)
+                        
+                        # Send if any valid reading (not all default)
+                        if front_clearance < 4.9 or rear_clearance < 4.9 or left_clearance < 4.9 or right_clearance < 4.9:
+                            payload = f"{front_clearance:.3f},{rear_clearance:.3f},{left_clearance:.3f},{right_clearance:.3f}"
+                            command_forwarder.send_command('obs', payload, priority=10)
+                            print(f"[ObstacleClearance] Front: {front_clearance:.3f}m, Rear: {rear_clearance:.3f}m, Left: {left_clearance:.3f}m, Right: {right_clearance:.3f}m")
+                            last_obs_send = now
+                    # =========================================================
 
                     accumulated_ranges = []
                     accumulated_angles = []
@@ -1118,43 +1218,43 @@ def lidar_and_odom_receiver(shared_packet, stop_event, lidar_port, baudrate, sca
 
             now = time.time()
             if now - last_log_time >= 10.0:
-                elapsed = now - last_log_time
-                low_quality_ratio = low_quality_points_in_interval / points_in_interval if points_in_interval > 0 else 0
-                print(f"[LiDAR] Statistics (last {elapsed:.1f}s):")
-                print(f"  - Scans: {scans_in_interval} ({scans_in_interval/elapsed:.1f} scans/s)")
-                print(f"  - Points: {points_in_interval} ({points_in_interval/elapsed:.1f} points/s)")
-                print(f"  - Low quality points: {low_quality_points_in_interval} ({low_quality_ratio*100:.1f}%)")
-                print(f"  - Total scans: {scan_counter}")
-                print(f"  - Total packets: {packet_id}")
+                # elapsed = now - last_log_time
+                # low_quality_ratio = low_quality_points_in_interval / points_in_interval if points_in_interval > 0 else 0
+                # print(f"[LiDAR] Statistics (last {elapsed:.1f}s):")
+                # print(f"  - Scans: {scans_in_interval} ({scans_in_interval/elapsed:.1f} scans/s)")
+                # print(f"  - Points: {points_in_interval} ({points_in_interval/elapsed:.1f} points/s)")
+                # print(f"  - Low quality points: {low_quality_points_in_interval} ({low_quality_ratio*100:.1f}%)")
+                # print(f"  - Total scans: {scan_counter}")
+                # print(f"  - Total packets: {packet_id}")
                 last_log_time = now
                 scans_in_interval = 0
                 points_in_interval = 0
                 low_quality_points_in_interval = 0
 
         except StopIteration:
-            print(f"[LiDAR] Scan generator ended after {scan_counter} scans, restarting...")
+            # print(f"[LiDAR] Scan generator ended after {scan_counter} scans, restarting...")
             try:
                 lidar.stop()
                 lidar.disconnect()
                 lidar = RPLidar(lidar_port, baudrate=baudrate)
                 scan_generator = lidar.iter_scans(scan_type=scan_type)
-                print("[LiDAR] Successfully reconnected")
+                # print("[LiDAR] Successfully reconnected")
             except Exception as e:
-                print(f"[LiDAR] Reconnect error: {e}")
+                # print(f"[LiDAR] Reconnect error: {e}")
                 time.sleep(1)
             continue
         except Exception as e:
-            print(f"[LiDAR] Scan error: {e}")
+            # print(f"[LiDAR] Scan error: {e}")
             time.sleep(0.01)
             continue
 
     try:
         lidar.stop()
         lidar.disconnect()
-        print("[LiDAR] Disconnected cleanly")
+        # print("[LiDAR] Disconnected cleanly")
     except:
         pass
-    print(f"[LiDAR] Stopped. Total scans: {scan_counter}, total packets: {packet_count}, last packet_id: {packet_id}")
+    # print(f"[LiDAR] Stopped. Total scans: {scan_counter}, total packets: {packet_count}, last packet_id: {packet_id}")
 
 # ---------- Relay handling ----------
 async def connect_to_relay():
@@ -1163,7 +1263,7 @@ async def connect_to_relay():
     while True:
         try:
             ssl_context = ssl.create_default_context()
-            print(f"[Bridge] Connecting to relay...")
+            # print(f"[Bridge] Connecting to relay...")
             relay_ws = await websockets.connect(RELAY_URL, ssl=ssl_context)
             await relay_ws.send(json.dumps({
                 "type": "register",
@@ -1174,16 +1274,17 @@ async def connect_to_relay():
             response = await relay_ws.recv()
             resp = json.loads(response)
             if resp.get("type") == "registered":
-                print(f"[Bridge] Registered as {BRIDGE_ID}")
+                # print(f"[Bridge] Registered as {BRIDGE_ID}")
                 with relay_lock:
                     relay_connected = True
                 asyncio.create_task(relay_message_handler(relay_ws))
                 return
             else:
-                print(f"[Bridge] Registration failed: {response}")
+                # print(f"[Bridge] Registration failed: {response}")
                 await relay_ws.close()
         except Exception as e:
-            print(f"[Bridge] Connection error: {e}")
+            # print(f"[Bridge] Connection error: {e}")
+            pass
         attempts += 1
         if MAX_RECONNECT_ATTEMPTS > 0 and attempts >= MAX_RECONNECT_ATTEMPTS:
             break
@@ -1197,13 +1298,15 @@ async def relay_message_handler(ws):
                 data = json.loads(message)
                 await process_relay_message(data)
             except json.JSONDecodeError:
-                print(f"[Bridge] Invalid JSON")
+                # print(f"[Bridge] Invalid JSON")
+                pass
     except websockets.exceptions.ConnectionClosed:
-        print("[Bridge] Relay closed")
+        # print("[Bridge] Relay closed")
         with relay_lock:
             relay_connected = False
     except Exception as e:
-        print(f"[Bridge] Handler error: {e}")
+        # print(f"[Bridge] Handler error: {e}")
+        pass
     finally:
         if not relay_connected:
             asyncio.create_task(connect_to_relay())
@@ -1211,7 +1314,7 @@ async def relay_message_handler(ws):
 # ---------- Process messages from UI ----------
 async def process_relay_message(data):
     global command_forwarder, planner
-    print(f"[Bridge] Received: {data}")
+    # print(f"[Bridge] Received: {data}")
 
     if data.get('type') == 'command':
         cmd = data.get('command')
@@ -1221,8 +1324,8 @@ async def process_relay_message(data):
         mode = data.get('mode')
         if mode in ['auto', 'manual', 'idle']:
             command_forwarder.send_command('mode', mode, priority=1)
-        else:
-            print(f"[Bridge] Unknown mode: {mode}")
+        # else:
+            # print(f"[Bridge] Unknown mode: {mode}")
 
     elif data.get('type') == 'set_waypoints':
         waypoints = data.get('waypoints', [])
@@ -1270,9 +1373,9 @@ async def process_relay_message(data):
             # Also reset ESP32 odometry
             if command_forwarder is not None:
                 command_forwarder.send_command('cmd', 'reset', priority=1)
-                print("[Bridge] Reset SLAM and sent reset to ESP32")
-        else:
-            print("[Bridge] SLAM processor not available")
+                # print("[Bridge] Reset SLAM and sent reset to ESP32")
+        # else:
+            # print("[Bridge] SLAM processor not available")
 
 # ---------- Broadcaster ----------
 async def websocket_broadcaster(shared_state, planner, stop_event):
@@ -1335,7 +1438,7 @@ async def websocket_broadcaster(shared_state, planner, stop_event):
                 try:
                     await relay_ws.send(json.dumps(output))
                 except Exception as e:
-                    print(f"[Broadcaster] Send error: {e}")
+                    # print(f"[Broadcaster] Send error: {e}")
                     with relay_lock:
                         relay_connected = False
         await asyncio.sleep(0.001)
@@ -1349,7 +1452,7 @@ async def main():
 
     serial_manager = SerialManager(SERIAL_PORT, SERIAL_BAUDRATE)
     if not serial_manager.start():
-        print("[Main] Serial failed")
+        # print("[Main] Serial failed")
         return
 
     command_forwarder = SerialCommandForwarder(serial_manager)
@@ -1359,7 +1462,8 @@ async def main():
 
     lidar_thread = threading.Thread(
         target=lidar_and_odom_receiver,
-        args=(shared_packet, stop_event, LIDAR_PORT, LIDAR_BAUDRATE, LIDAR_SCAN_TYPE, serial_manager),
+        args=(shared_packet, stop_event, LIDAR_PORT, LIDAR_BAUDRATE,
+            LIDAR_SCAN_TYPE, serial_manager, command_forwarder),
         daemon=True
     )
     lidar_thread.start()
@@ -1389,7 +1493,8 @@ async def main():
                 planner.check_replan(slam_state.x, slam_state.y, map_update_id)
             await asyncio.sleep(0.05)
     except KeyboardInterrupt:
-        print("\n[Main] Shutting down...")
+        # print("\n[Main] Shutting down...")
+        pass
     finally:
         stop_event.set()
         broadcaster_task.cancel()
@@ -1400,7 +1505,7 @@ async def main():
         if relay_ws:
             await relay_ws.close()
         serial_manager.stop()
-        print("[Main] Shutdown complete")
+        # print("[Main] Shutdown complete")
 
 if __name__ == "__main__":
     asyncio.run(main())
