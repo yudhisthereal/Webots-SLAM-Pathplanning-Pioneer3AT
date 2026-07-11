@@ -23,7 +23,7 @@ from scipy.ndimage import binary_dilation, generate_binary_structure
 from rplidar import RPLidar
 
 # ============ Configuration ============
-SERIAL_PORT = "COM7"
+SERIAL_PORT = "COM12"
 SERIAL_BAUDRATE = 115200
 SERIAL_TIMEOUT = 0.1
 
@@ -58,11 +58,11 @@ SCAN_MATCH_TRANSLATION_STEP = 0.05
 
 ANGULAR_VEL_THRESHOLD = 0.2
 
-FLIP_THETA_FOR_VISUALIZATION = True
-FLIP_ROBOT_Y_FROM_SIM = True
+FLIP_THETA_FOR_VISUALIZATION = False
+FLIP_ROBOT_Y_FROM_SIM = False
 
 CORRECTION_WEIGHT = 0.05
-ENABLE_SCAN_MATCHING = True
+ENABLE_SCAN_MATCHING = False
 
 RELAY_URL = "wss://kmo-relayserver.yudhisthereal.workers.dev"
 BRIDGE_ID = "my_robot_01"
@@ -92,10 +92,119 @@ relay_ws = None
 relay_connected = False
 relay_lock = threading.Lock()
 slam_processor = None
+reset_coordinator = None
 
 # ---- Robot physical dimensions ----
 ROBOT_LENGTH = 0.71       # meters
 ROBOT_HALF_WIDTH = 0.195  # 0.39/2
+
+# ============ Reset Coordinator ============
+class ResetCoordinator:
+    """
+    Deterministic state machine for SLAM reset.
+    Uses asyncio.Event for clean async waiting.
+    All state transitions happen through public methods.
+    """
+    IDLE = 0
+    WAITING_ODOM = 1
+    DISCARDING_SCAN = 2
+    
+    def __init__(self, loop):
+        self._lock = threading.Lock()
+        self._state = self.IDLE
+        self.current_epoch = 0
+        self.odom_confirmed = asyncio.Event()
+        self.scan_discarded = asyncio.Event()
+        self._scans_to_discard = 1
+        self.loop = loop
+        self._aborted = False
+    
+    def start_reset(self):
+        """Non-blocking. Returns True if reset was started."""
+        with self._lock:
+            if self._state != self.IDLE:
+                return False
+            self._state = self.WAITING_ODOM
+            self._aborted = False
+            self.odom_confirmed.clear()
+            self.scan_discarded.clear()
+            self._scans_to_discard = 1
+            print("[ResetCoordinator] Reset started, waiting for odometry zero")
+            return True
+    
+    def notify_odometry_zero(self):
+        """Called from SerialManager when odometry reaches zero."""
+        with self._lock:
+            if self._state == self.WAITING_ODOM and not self._aborted:
+                self._state = self.DISCARDING_SCAN
+                # Use call_soon_threadsafe since we're in a non-asyncio thread
+                try:
+                    self.loop.call_soon_threadsafe(self.odom_confirmed.set)
+                except RuntimeError as e:
+                    print(e)
+                    pass
+                print("[ResetCoordinator] Odometry confirmed zero, discarding next scan")
+    
+    def notify_scan_ready(self):
+        """
+        Called from LiDAR receiver before publishing a scan.
+        Returns True if scan should be published, False if should be discarded.
+        This is the single source of truth for scan gating.
+        """
+        with self._lock:
+            if self._aborted:
+                return True
+            
+            if self._state == self.DISCARDING_SCAN:
+                self._scans_to_discard -= 1
+                if self._scans_to_discard <= 0:
+                    self.current_epoch += 1
+                    self._state = self.IDLE
+                    try:
+                        self.loop.call_soon_threadsafe(self.scan_discarded.set)
+                    except RuntimeError:
+                        pass
+                    print(f"[ResetCoordinator] Scan discarded, reset complete. Epoch={self.current_epoch}")
+                return False
+            
+            # In WAITING_ODOM or IDLE, allow publishing
+            return True
+    
+    def abort_reset(self):
+        """Cleanly abort an in-progress reset. Returns to IDLE."""
+        with self._lock:
+            if self._state != self.IDLE:
+                self._state = self.IDLE
+                self._aborted = True
+                self._scans_to_discard = 1
+                try:
+                    self.loop.call_soon_threadsafe(self.odom_confirmed.set)
+                    self.loop.call_soon_threadsafe(self.scan_discarded.set)
+                except RuntimeError:
+                    pass
+                print("[ResetCoordinator] Reset aborted")
+    
+    def get_epoch(self):
+        return self.current_epoch
+    
+    def is_reset_in_progress(self):
+        with self._lock:
+            return self._state != self.IDLE
+    
+    def should_discard_before_accumulation(self):
+        """
+        Returns True only during WAITING_ODOM phase.
+        During this phase, scans should be discarded immediately without accumulation.
+        During DISCARDING_SCAN, returns False so scans can be accumulated and then
+        gated by notify_scan_ready().
+        """
+        with self._lock:
+            return self._state == self.WAITING_ODOM
+    
+    def clear_accumulation(self):
+        """Signal that LiDAR accumulation should be cleared."""
+        # This is handled by the receiver checking notify_scan_ready()
+        pass
 
 # ============ Config ============
 def load_config():
@@ -104,21 +213,16 @@ def load_config():
         with open(CONFIG_FILE, 'r') as f:
             saved = json.load(f)
             robot_config.update(saved)
-            # print(f"[Config] Loaded from {CONFIG_FILE}")
     except FileNotFoundError:
-        # print("[Config] No config file, using defaults")
         pass
     except Exception as e:
-        # print(f"[Config] Error: {e}")
         pass
 
 def save_config():
     try:
         with open(CONFIG_FILE, 'w') as f:
             json.dump(robot_config, f, indent=2)
-        # print(f"[Config] Saved to {CONFIG_FILE}")
     except Exception as e:
-        # print(f"[Config] Save error: {e}")
         pass
 
 def send_config_to_robot():
@@ -131,7 +235,6 @@ def send_config_to_robot():
         f"{robot_config['stop_distance']}"
     )
     command_forwarder.send_command('config', config_str, priority=5)
-    # print(f"[Config] Sent to ESP32: {config_str}")
 
 # ============ Data containers ============
 @dataclass(frozen=True)
@@ -147,6 +250,7 @@ class SimulationPacket:
     right_speed: float = 0
     linear_vel: float = 0
     angular_vel: float = 0
+    reset_epoch: int = 0
 
 @dataclass(frozen=True)
 class SlamState:
@@ -167,12 +271,13 @@ class SlamState:
     linear_vel: float = 0
     angular_vel: float = 0
     scan_matching_skipped: bool = False
+    reset_epoch: int = 0
 
 @dataclass
 class Command:
     priority: int
     timestamp: float
-    command_type: str  # 'mode', 'cmd', 'path', 'config'
+    command_type: str
     payload: Any
     callback: Optional[callable] = None
 
@@ -384,6 +489,7 @@ class SlamProcessor:
         self.processed_count = 0
         self.state_id = 0
         self.skipped_count = 0
+        self.current_epoch = 0
 
     def process_loop(self, stop_event):
         while not stop_event.is_set():
@@ -391,6 +497,11 @@ class SlamProcessor:
             if packet is None or generation == self.last_generation:
                 time.sleep(0.0001)
                 continue
+            
+            if packet.reset_epoch < self.current_epoch:
+                self.last_generation = generation
+                continue
+            
             self.last_generation = generation
             self.process_packet(packet)
 
@@ -455,13 +566,13 @@ class SlamProcessor:
             right_speed=packet.right_speed,
             linear_vel=packet.linear_vel,
             angular_vel=packet.angular_vel,
-            scan_matching_skipped=is_rotating_fast
+            scan_matching_skipped=is_rotating_fast,
+            reset_epoch=packet.reset_epoch
         )
         self.shared_state.update(new_state)
     
     def reset_slam(self):
-        """Reset all SLAM state and clear the map."""
-        global robot_config
+        global robot_config, reset_coordinator
         self.map_grid = OccupancyGrid(
             MAP_SIZE, MAP_SIZE, MAP_RESOLUTION,
             offset_x=robot_config.get("lidar_offset_x", 0.0),
@@ -474,8 +585,14 @@ class SlamProcessor:
         self.processed_count = 0
         self.skipped_count = 0
         self.state_id = 0
-        self.last_generation = 0   # important to prevent old packets from being processed
-        # print("[SlamProcessor] Reset SLAM (map cleared, pose zeroed)")
+        
+        if reset_coordinator:
+            self.current_epoch = reset_coordinator.get_epoch()
+        
+        packet, generation = self.shared_packet.get_latest()
+        self.last_generation = generation
+        
+        print(f"[SlamProcessor] Reset complete (epoch={self.current_epoch})")
 
     def get_map(self):
         return self.map_grid.get_map()
@@ -514,9 +631,7 @@ class SerialManager:
             self._ser = serial.Serial(self.port, self.baudrate, timeout=self.timeout)
             self._ser.flushInput()
             self._ser.flushOutput()
-            # print(f"[SerialManager] Opened {self.port}")
         except Exception as e:
-            # print(f"[SerialManager] Failed: {e}")
             return False
         self._stop_event.clear()
         self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
@@ -540,7 +655,6 @@ class SerialManager:
                     self._commands_sent += 1
                     return True
                 except Exception as e:
-                    # print(f"[SerialManager] Write error: {e}")
                     return False
             return False
 
@@ -558,6 +672,7 @@ class SerialManager:
             }
 
     def _reader_loop(self):
+        global reset_coordinator
         while not self._stop_event.is_set():
             try:
                 if self._ser is None or not self._ser.is_open:
@@ -580,10 +695,10 @@ class SerialManager:
                 else:
                     time.sleep(0.001)
             except Exception as e:
-                # print(f"[SerialManager] Reader error: {e}")
                 time.sleep(0.1)
 
     def _parse_line(self, line):
+        global reset_coordinator
         if line.startswith("ODOM,"):
             try:
                 parts = line.split(',')
@@ -604,10 +719,13 @@ class SerialManager:
                         self._linear_vel = lin
                         self._angular_vel = ang
                         self._last_odom_update = time.time()
+                    
+                    if (reset_coordinator and 
+                        reset_coordinator.is_reset_in_progress() and 
+                        abs(x) < 0.01 and abs(y) < 0.01 and abs(theta) < 0.02):
+                        reset_coordinator.notify_odometry_zero()
             except Exception as e:
                 self._parse_errors += 1
-                # if self._parse_errors % 10 == 0:
-                #     print(f"[SerialManager] Parse error: {e}")
 
 # ---------- SerialCommandForwarder ----------
 class SerialCommandForwarder:
@@ -623,7 +741,6 @@ class SerialCommandForwarder:
         self.stop_event.clear()
         self._thread = threading.Thread(target=self._forward_loop, daemon=True)
         self._thread.start()
-        # print("[SerialCommandForwarder] Started")
 
     def stop(self):
         self.stop_event.set()
@@ -634,26 +751,32 @@ class SerialCommandForwarder:
         cmd = Command(priority=priority, timestamp=time.time(),
                       command_type=command_type, payload=payload, callback=callback)
         self.command_queue.put((priority, time.time(), cmd))
-
+        
     def _forward_loop(self):
         while not self.stop_event.is_set():
             try:
                 _, _, cmd = self.command_queue.get(timeout=0.01)
             except queue.Empty:
                 continue
-            message = self._build_command(cmd.command_type, cmd.payload)
-            if message:
-                if self.serial_manager.write(message):
+            
+            if cmd.command_type == 'raw':
+                if self.serial_manager.write(cmd.payload):
                     if cmd.callback:
                         cmd.callback(True)
-                else:
-                    if cmd.callback:
-                        cmd.callback(False)
+            else:
+                message = self._build_command(cmd.command_type, cmd.payload)
+                if message:
+                    if self.serial_manager.write(message):
+                        if cmd.callback:
+                            cmd.callback(True)
+                    else:
+                        if cmd.callback:
+                            cmd.callback(False)
             time.sleep(0.01)
 
     def _build_command(self, cmd_type, payload):
         if cmd_type == 'mode':
-            return f"MODE:{payload}"          # auto / manual / idle
+            return f"MODE:{payload}"
         elif cmd_type == 'cmd':
             return f"CMD:{payload}"
         elif cmd_type == 'path':
@@ -795,7 +918,6 @@ def astar_plan(coarse, start_xy, goal_xy):
 
     path = [to_world(px, py) for (px, py) in path_idx]
 
-    # Simplify using Bresenham
     simplified = []
     def bresenham_clear(a, b):
         ax, ay = a
@@ -839,7 +961,7 @@ def astar_plan(coarse, start_xy, goal_xy):
 
     return simplified
 
-# ---------- PlannerWorker (modified: no auto send) ----------
+# ---------- PlannerWorker ----------
 class PlannerWorker:
     def __init__(self, shared_state, command_forwarder):
         self.shared_state = shared_state
@@ -984,31 +1106,27 @@ class PlannerWorker:
             with self.lock:
                 self.path = planned
                 self.last_plan_time = time.time()
-            # Send path to ESP32 (with Y flip) – DO NOT send auto enable
             if planned:
-                robot_path = [(x, -y) for x, y in planned]   # flip Y for robot odometry
+                robot_path = [(x, -y) for x, y in planned]
                 self.command_forwarder.send_command('path', robot_path, priority=5)
             time.sleep(0.05)
 
 # ---------- LiDAR receiver ----------
 def lidar_and_odom_receiver(shared_packet, stop_event, lidar_port, baudrate, scan_type, serial_manager, command_forwarder):
     """
-    LiDAR receiver thread:
-    - Accumulates scans
-    - Builds a SimulationPacket with odometry and scan data
-    - Updates shared_packet for SLAM
-    - Computes obstacle clearances (front, rear, left, right) and sends OBS: command to ESP32
+    LiDAR receiver thread.
+    Discards scans before accumulation when reset is in progress.
+    notify_scan_ready() is the single source of truth for scan gating.
     """
+    global reset_coordinator
     packet_count = 0
     packet_id = 0
 
     try:
         lidar = RPLidar(lidar_port, baudrate=baudrate, timeout=3)
         info = lidar.get_info()
-        # print(f"[LiDAR] Connected! Model: {info.get('model', 'unknown')}, Firmware: {info.get('firmware', 'unknown')}")
         scan_generator = lidar.iter_scans(scan_type=scan_type)
     except Exception as e:
-        # print(f"[LiDAR] Failed to open LiDAR: {e}")
         return
 
     scan_counter = 0
@@ -1028,7 +1146,6 @@ def lidar_and_odom_receiver(shared_packet, stop_event, lidar_port, baudrate, sca
     accumulated_angle_min = float('inf')
     accumulated_angle_max = -float('inf')
 
-    # For OBS throttling
     last_obs_send = 0
 
     while not stop_event.is_set():
@@ -1037,21 +1154,22 @@ def lidar_and_odom_receiver(shared_packet, stop_event, lidar_port, baudrate, sca
             packet_id += 1
             scan_counter += 1
 
+            # Discard scans BEFORE accumulation ONLY during WAITING_ODOM phase.
+            # During DISCARDING_SCAN phase, allow accumulation so notify_scan_ready()
+            # can gate the completed scan.
+            if reset_coordinator and reset_coordinator.should_discard_before_accumulation():
+                continue
+
             ranges = []
             angles = []
             low_quality_count = 0
-            low_quality_points = []
 
             for quality, angle, distance in scan:
                 if distance > 0:
                     if quality < 15:
                         low_quality_count += 1
-                        low_quality_points.append((quality, angle, distance))
                     ranges.append(distance / 1000.0)
                     angles.append(math.radians(angle))
-
-            # if low_quality_count > 0:
-            #     print(f"[LiDAR WARNING] Scan #{scan_counter}: {low_quality_count} low quality points (quality < 15)")
 
             if len(ranges) > 0:
                 if accumulated_timestamp is None:
@@ -1079,21 +1197,32 @@ def lidar_and_odom_receiver(shared_packet, stop_event, lidar_port, baudrate, sca
                 time_elapsed = current_time - last_accumulation_start
 
                 should_send = False
-                send_reason = ""
 
                 if (accumulated_scan_count >= MIN_SCANS_TO_ACCUMULATE and 
                     angle_coverage >= MIN_ANGLE_COVERAGE):
                     should_send = True
-                    send_reason = f"coverage {angle_coverage:.1f} deg with {accumulated_scan_count} scans"
                 elif time_elapsed >= MAX_ACCUMULATION_TIME and accumulated_scan_count >= 2:
                     should_send = True
-                    send_reason = f"timeout ({time_elapsed:.2f}s) with coverage {angle_coverage:.1f} deg"
                 elif accumulated_scan_count >= 10:
                     should_send = True
-                    send_reason = f"many scans ({accumulated_scan_count}) with coverage {angle_coverage:.1f} deg"
 
                 if should_send:
-                    # print(f"[LiDAR] Accumulated {len(accumulated_ranges)} points from {accumulated_scan_count} scans")
+                    # notify_scan_ready() is the single source of truth
+                    # It handles both the discard phase and normal operation
+                    allow_publish = True
+                    if reset_coordinator:
+                        allow_publish = reset_coordinator.notify_scan_ready()
+                    
+                    if not allow_publish:
+                        # Scan was discarded - clear accumulation and continue
+                        accumulated_ranges = []
+                        accumulated_angles = []
+                        accumulated_scan_count = 0
+                        accumulated_timestamp = None
+                        accumulated_angle_min = float('inf')
+                        accumulated_angle_max = -float('inf')
+                        continue
+                    
                     if serial_manager:
                         odom = serial_manager.get_latest_odometry()
                         robot_x = odom['robot_x']
@@ -1107,6 +1236,8 @@ def lidar_and_odom_receiver(shared_packet, stop_event, lidar_port, baudrate, sca
                         robot_x = robot_y = robot_theta = 0.0
                         left_speed = right_speed = linear_vel = angular_vel = 0.0
 
+                    current_epoch = reset_coordinator.get_epoch() if reset_coordinator else 0
+
                     packet = SimulationPacket(
                         packet_id=packet_id,
                         timestamp=time.time(),
@@ -1118,29 +1249,24 @@ def lidar_and_odom_receiver(shared_packet, stop_event, lidar_port, baudrate, sca
                         left_speed=left_speed,
                         right_speed=right_speed,
                         linear_vel=linear_vel,
-                        angular_vel=angular_vel
+                        angular_vel=angular_vel,
+                        reset_epoch=current_epoch
                     )
                     shared_packet.update(packet)
                     packet_count += 1
-                    # print(f"[LiDAR] Packet #{packet_id} updated shared state: {len(accumulated_ranges)} points")
 
-                    # ============= OBSTACLE CLEARANCE COMPUTATION (CORRECTED FOR REAR-MOUNTED LIDAR) =============
-                    # Throttle OBS sending to ~5 Hz
+                    # Obstacle clearance computation
                     now = time.time()
                     if now - last_obs_send >= 0.2:
-                        # Initialize clearances to maximum
                         front_clearance = float('inf')
                         rear_clearance = float('inf')
                         left_clearance = float('inf')
                         right_clearance = float('inf')
                         
                         for r, angle in zip(accumulated_ranges, accumulated_angles):
-                            # Filter invalid measurements
                             if r < MIN_RANGE or r > MAX_RANGE:
                                 continue
                             
-                            # LiDAR angle is absolute (0° = forward, +left, -right in radians)
-                            # Normalize angle to [-pi, pi]
                             normalized_angle = angle
                             while normalized_angle > math.pi:
                                 normalized_angle -= 2 * math.pi
@@ -1149,39 +1275,23 @@ def lidar_and_odom_receiver(shared_packet, stop_event, lidar_port, baudrate, sca
                             
                             angle_deg = math.degrees(normalized_angle)
                             
-                            # Front sector: -30° to +30°
                             if abs(angle_deg) <= 30:
-                                # LiDAR at rear, so front of robot is ROBOT_LENGTH ahead
-                                # Clearance = distance * cos(angle) - ROBOT_LENGTH
                                 clearance = r * math.cos(normalized_angle) - ROBOT_LENGTH
                                 if clearance < front_clearance:
                                     front_clearance = clearance
-                            
-                            # Rear sector: 180° ± 30° (150° to 210°)
                             elif abs(abs(angle_deg) - 180) <= 30:
-                                # LiDAR at rear, so rear clearance is just the distance
-                                # Since LiDAR is at the back edge, no robot body to subtract
                                 clearance = r
                                 if clearance < rear_clearance:
                                     rear_clearance = clearance
-                            
-                            # Left sector: +30° to +90°
                             elif 30 <= angle_deg <= 90:
-                                # LiDAR at rear, left side clearance
-                                # Clearance = distance * sin(angle) - HALF_WIDTH
                                 clearance = r * math.sin(normalized_angle) - ROBOT_HALF_WIDTH
                                 if clearance < left_clearance:
                                     left_clearance = clearance
-                            
-                            # Right sector: -90° to -30°
                             elif -90 <= angle_deg <= -30:
-                                # LiDAR at rear, right side clearance
-                                # Clearance = distance * |sin(angle)| - HALF_WIDTH
                                 clearance = r * abs(math.sin(normalized_angle)) - ROBOT_HALF_WIDTH
                                 if clearance < right_clearance:
                                     right_clearance = clearance
                         
-                        # Set default if no points in sector (no obstacles detected)
                         if front_clearance == float('inf'):
                             front_clearance = MAX_RANGE
                         if rear_clearance == float('inf'):
@@ -1191,19 +1301,15 @@ def lidar_and_odom_receiver(shared_packet, stop_event, lidar_port, baudrate, sca
                         if right_clearance == float('inf'):
                             right_clearance = MAX_RANGE
                         
-                        # Ensure non-negative values
                         front_clearance = max(0.0, front_clearance)
                         rear_clearance = max(0.0, rear_clearance)
                         left_clearance = max(0.0, left_clearance)
                         right_clearance = max(0.0, right_clearance)
                         
-                        # Send if any valid reading (not all default)
                         if front_clearance < 4.9 or rear_clearance < 4.9 or left_clearance < 4.9 or right_clearance < 4.9:
                             payload = f"{front_clearance:.3f},{rear_clearance:.3f},{left_clearance:.3f},{right_clearance:.3f}"
                             command_forwarder.send_command('obs', payload, priority=10)
-                            print(f"[ObstacleClearance] Front: {front_clearance:.3f}m, Rear: {rear_clearance:.3f}m, Left: {left_clearance:.3f}m, Right: {right_clearance:.3f}m")
                             last_obs_send = now
-                    # =========================================================
 
                     accumulated_ranges = []
                     accumulated_angles = []
@@ -1218,43 +1324,29 @@ def lidar_and_odom_receiver(shared_packet, stop_event, lidar_port, baudrate, sca
 
             now = time.time()
             if now - last_log_time >= 10.0:
-                # elapsed = now - last_log_time
-                # low_quality_ratio = low_quality_points_in_interval / points_in_interval if points_in_interval > 0 else 0
-                # print(f"[LiDAR] Statistics (last {elapsed:.1f}s):")
-                # print(f"  - Scans: {scans_in_interval} ({scans_in_interval/elapsed:.1f} scans/s)")
-                # print(f"  - Points: {points_in_interval} ({points_in_interval/elapsed:.1f} points/s)")
-                # print(f"  - Low quality points: {low_quality_points_in_interval} ({low_quality_ratio*100:.1f}%)")
-                # print(f"  - Total scans: {scan_counter}")
-                # print(f"  - Total packets: {packet_id}")
                 last_log_time = now
                 scans_in_interval = 0
                 points_in_interval = 0
                 low_quality_points_in_interval = 0
 
         except StopIteration:
-            # print(f"[LiDAR] Scan generator ended after {scan_counter} scans, restarting...")
             try:
                 lidar.stop()
                 lidar.disconnect()
                 lidar = RPLidar(lidar_port, baudrate=baudrate)
                 scan_generator = lidar.iter_scans(scan_type=scan_type)
-                # print("[LiDAR] Successfully reconnected")
             except Exception as e:
-                # print(f"[LiDAR] Reconnect error: {e}")
                 time.sleep(1)
             continue
         except Exception as e:
-            # print(f"[LiDAR] Scan error: {e}")
             time.sleep(0.01)
             continue
 
     try:
         lidar.stop()
         lidar.disconnect()
-        # print("[LiDAR] Disconnected cleanly")
     except:
         pass
-    # print(f"[LiDAR] Stopped. Total scans: {scan_counter}, total packets: {packet_count}, last packet_id: {packet_id}")
 
 # ---------- Relay handling ----------
 async def connect_to_relay():
@@ -1263,7 +1355,6 @@ async def connect_to_relay():
     while True:
         try:
             ssl_context = ssl.create_default_context()
-            # print(f"[Bridge] Connecting to relay...")
             relay_ws = await websockets.connect(RELAY_URL, ssl=ssl_context)
             await relay_ws.send(json.dumps({
                 "type": "register",
@@ -1274,16 +1365,13 @@ async def connect_to_relay():
             response = await relay_ws.recv()
             resp = json.loads(response)
             if resp.get("type") == "registered":
-                # print(f"[Bridge] Registered as {BRIDGE_ID}")
                 with relay_lock:
                     relay_connected = True
                 asyncio.create_task(relay_message_handler(relay_ws))
                 return
             else:
-                # print(f"[Bridge] Registration failed: {response}")
                 await relay_ws.close()
         except Exception as e:
-            # print(f"[Bridge] Connection error: {e}")
             pass
         attempts += 1
         if MAX_RECONNECT_ATTEMPTS > 0 and attempts >= MAX_RECONNECT_ATTEMPTS:
@@ -1298,14 +1386,11 @@ async def relay_message_handler(ws):
                 data = json.loads(message)
                 await process_relay_message(data)
             except json.JSONDecodeError:
-                # print(f"[Bridge] Invalid JSON")
                 pass
     except websockets.exceptions.ConnectionClosed:
-        # print("[Bridge] Relay closed")
         with relay_lock:
             relay_connected = False
     except Exception as e:
-        # print(f"[Bridge] Handler error: {e}")
         pass
     finally:
         if not relay_connected:
@@ -1313,8 +1398,7 @@ async def relay_message_handler(ws):
 
 # ---------- Process messages from UI ----------
 async def process_relay_message(data):
-    global command_forwarder, planner
-    # print(f"[Bridge] Received: {data}")
+    global command_forwarder, planner, slam_processor, reset_coordinator
 
     if data.get('type') == 'command':
         cmd = data.get('command')
@@ -1324,8 +1408,6 @@ async def process_relay_message(data):
         mode = data.get('mode')
         if mode in ['auto', 'manual', 'idle']:
             command_forwarder.send_command('mode', mode, priority=1)
-        # else:
-            # print(f"[Bridge] Unknown mode: {mode}")
 
     elif data.get('type') == 'set_waypoints':
         waypoints = data.get('waypoints', [])
@@ -1333,7 +1415,6 @@ async def process_relay_message(data):
         if waypoints:
             wp_list = [(p['x'], p['y']) for p in waypoints]
             planner.set_waypoints(wp_list, loop)
-            # Send to ESP32 with Y flip
             robot_path = [(x, -y) for x, y in wp_list]
             command_forwarder.send_command('path', robot_path, priority=5)
         else:
@@ -1344,7 +1425,6 @@ async def process_relay_message(data):
         gx = float(data.get('x', 0.0))
         gy = float(data.get('y', 0.0))
         planner.set_goal(gx, gy)
-        # Send as single-point path with Y flip
         robot_path = [(gx, -gy)]
         command_forwarder.send_command('path', robot_path, priority=5)
 
@@ -1367,15 +1447,50 @@ async def process_relay_message(data):
                 'type': 'config',
                 'config': robot_config
             }))
+    
     elif data.get('type') == 'reset_slam':
-        if slam_processor is not None:
-            slam_processor.reset_slam()
-            # Also reset ESP32 odometry
-            if command_forwarder is not None:
-                command_forwarder.send_command('cmd', 'reset', priority=1)
-                # print("[Bridge] Reset SLAM and sent reset to ESP32")
-        # else:
-            # print("[Bridge] SLAM processor not available")
+        await perform_reset()
+
+async def perform_reset():
+    """Synchronous reset state machine driven by asyncio.Events."""
+    global reset_coordinator, command_forwarder, slam_processor
+    
+    if reset_coordinator is None:
+        return
+    
+    if not reset_coordinator.start_reset():
+        print("[Bridge] Reset already in progress")
+        return
+    
+    command_forwarder.send_command(
+        "cmd",
+        "reset",
+        priority=1
+    )
+    print("[Bridge] Reset sent to ESP32, waiting for odometry zero...")
+    
+    # Wait for odometry to reach zero (asyncio.Event, no executor needed)
+    try:
+        await asyncio.wait_for(reset_coordinator.odom_confirmed.wait(), timeout=5.0)
+    except asyncio.TimeoutError:
+        print("[Bridge] Timeout waiting for odometry reset")
+        reset_coordinator.abort_reset()
+        return
+    
+    print("[Bridge] Odometry confirmed zero, waiting for fresh scan...")
+    
+    # Wait for one full scan to be discarded
+    try:
+        await asyncio.wait_for(reset_coordinator.scan_discarded.wait(), timeout=3.0)
+    except asyncio.TimeoutError:
+        print("[Bridge] Timeout waiting for scan discard")
+        reset_coordinator.abort_reset()
+        return
+    
+    if slam_processor:
+        slam_processor.reset_slam()
+    
+    print("[Bridge] SLAM reset complete")
 
 # ---------- Broadcaster ----------
 async def websocket_broadcaster(shared_state, planner, stop_event):
@@ -1408,11 +1523,9 @@ async def websocket_broadcaster(shared_state, planner, stop_event):
                     "angular_vel": slam_state.angular_vel,
                     "slam_match_score": slam_state.match_score,
                     "scan_matching_skipped": slam_state.scan_matching_skipped,
-                    # No auto_navigate field
                 }
                 if now - last_map >= map_interval:
                     output["map"] = slam_processor.get_map()
-                    # Add coarse grid (optional)
                     map_data = slam_processor.get_map()
                     robot_width = robot_config.get('robot_width', 0.41)
                     coarse = coarse_grid_from_map(map_data, COARSE_FACTOR, robot_width)
@@ -1438,21 +1551,22 @@ async def websocket_broadcaster(shared_state, planner, stop_event):
                 try:
                     await relay_ws.send(json.dumps(output))
                 except Exception as e:
-                    # print(f"[Broadcaster] Send error: {e}")
                     with relay_lock:
                         relay_connected = False
         await asyncio.sleep(0.001)
 
 # ---------- Main ----------
 async def main():
-    global shared_packet, shared_state, planner, command_forwarder, serial_manager, slam_processor
+    global shared_packet, shared_state, planner, command_forwarder, serial_manager, slam_processor, reset_coordinator
     shared_packet = AtomicSharedPacket()
     shared_state = AtomicSharedState()
     stop_event = threading.Event()
+    
+    loop = asyncio.get_event_loop()
+    reset_coordinator = ResetCoordinator(loop)
 
     serial_manager = SerialManager(SERIAL_PORT, SERIAL_BAUDRATE)
     if not serial_manager.start():
-        # print("[Main] Serial failed")
         return
 
     command_forwarder = SerialCommandForwarder(serial_manager)
@@ -1482,7 +1596,7 @@ async def main():
     )
 
     load_config()
-    send_config_to_robot()  # initial config to ESP32
+    send_config_to_robot()
 
     try:
         while not stop_event.is_set():
@@ -1493,7 +1607,6 @@ async def main():
                 planner.check_replan(slam_state.x, slam_state.y, map_update_id)
             await asyncio.sleep(0.05)
     except KeyboardInterrupt:
-        # print("\n[Main] Shutting down...")
         pass
     finally:
         stop_event.set()
@@ -1505,7 +1618,6 @@ async def main():
         if relay_ws:
             await relay_ws.close()
         serial_manager.stop()
-        # print("[Main] Shutdown complete")
 
 if __name__ == "__main__":
     asyncio.run(main())
