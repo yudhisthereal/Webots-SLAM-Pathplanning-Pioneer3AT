@@ -23,7 +23,7 @@ from scipy.ndimage import binary_dilation, generate_binary_structure
 from rplidar import RPLidar
 
 # ============ Configuration ============
-SERIAL_PORT = "COM12"
+SERIAL_PORT = "COM13"
 SERIAL_BAUDRATE = 115200
 SERIAL_TIMEOUT = 0.1
 
@@ -57,9 +57,6 @@ SCAN_MATCH_TRANSLATION_RANGE = 0.20
 SCAN_MATCH_TRANSLATION_STEP = 0.05
 
 ANGULAR_VEL_THRESHOLD = 0.2
-
-FLIP_THETA_FOR_VISUALIZATION = False
-FLIP_ROBOT_Y_FROM_SIM = False
 
 CORRECTION_WEIGHT = 0.05
 ENABLE_SCAN_MATCHING = False
@@ -356,7 +353,7 @@ class OccupancyGrid:
             angle = angles[i]
             if r < MIN_RANGE or r > MAX_RANGE:
                 continue
-            beam_angle = robot_theta + angle
+            beam_angle = angle - robot_theta
             cos_beam = math.cos(beam_angle)
             sin_beam = math.sin(beam_angle)
             quarter_x = lidar_x + 0.25 * r * cos_beam
@@ -436,17 +433,18 @@ class OccupancyGrid:
         for i in range(len(ranges)):
             r = ranges[i]
             angle = angles[i]
+            map_angle = angle - robot_theta
             if r < MIN_RANGE or r > MAX_RANGE:
                 continue
-            end_x = lidar_x + r * math.cos(robot_theta + angle)
-            end_y = lidar_y + r * math.sin(robot_theta + angle)
+            end_x = lidar_x + r * math.cos(map_angle)
+            end_y = lidar_y + r * math.sin(map_angle)
             gx, gy = self.world_to_grid(end_x, end_y)
             self.mark_occupied_with_neighbors(gx, gy)
             steps = int(r / self.resolution)
             for step in range(steps):
                 t = step * self.resolution / r
-                ray_x = lidar_x + r * t * math.cos(robot_theta + angle)
-                ray_y = lidar_y + r * t * math.sin(robot_theta + angle)
+                ray_x = lidar_x + r * t * math.cos(map_angle)
+                ray_y = lidar_y + r * t * math.sin(map_angle)
                 gx, gy = self.world_to_grid(ray_x, ray_y)
                 if 0 <= gx < self.width and 0 <= gy < self.height:
                     self.log_odds[gy, gx] += LOG_ODDS_FREE
@@ -514,7 +512,7 @@ class SlamProcessor:
             self.skipped_count += 1
 
         current_x = packet.robot_x
-        current_y = -packet.robot_y if FLIP_ROBOT_Y_FROM_SIM else packet.robot_y
+        current_y = packet.robot_y
         current_theta = packet.robot_theta
         match_score = 0.0
 
@@ -1430,11 +1428,52 @@ async def process_relay_message(data):
 
     elif data.get('type') == 'set_config':
         new_config = data.get('config', {})
+        
+        # Validate all fields
+        required_fields = ['wheel_radius', 'wheel_base', 'lidar_offset_x', 'lidar_offset_y', 
+                        'max_speed', 'robot_width', 'stop_distance']
+        
+        valid = True
+        for field in required_fields:
+            if field not in new_config:
+                valid = False
+                break
+            try:
+                val = float(new_config[field])
+                if not (isinstance(val, float) and not math.isnan(val) and math.isfinite(val)):
+                    valid = False
+                    break
+            except (TypeError, ValueError):
+                valid = False
+                break
+        
+        # Additional constraints
+        if valid:
+            if (new_config['wheel_radius'] <= 0 or 
+                new_config['wheel_base'] <= 0 or 
+                new_config['robot_width'] <= 0 or 
+                new_config['stop_distance'] < 0 or 
+                new_config['max_speed'] < 0):
+                valid = False
+        
+        if not valid:
+            print("[Bridge] Invalid config received, rejecting")
+            if relay_ws and relay_connected:
+                await relay_ws.send(json.dumps({
+                    'type': 'config_error',
+                    'error': 'Invalid configuration values'
+                }))
+            return
+        
+        # Update config
         for key, value in new_config.items():
             if key in robot_config:
-                robot_config[key] = value
+                robot_config[key] = float(value)
+        
         save_config()
         send_config_to_robot()
+        
+        # Broadcast updated config
         if relay_ws and relay_connected:
             await relay_ws.send(json.dumps({
                 'type': 'config_updated',
@@ -1516,7 +1555,7 @@ async def websocket_broadcaster(shared_state, planner, stop_event):
                     "angles": list(slam_state.angles),
                     "robot_x": slam_state.x,
                     "robot_y": slam_state.y,
-                    "robot_theta": -slam_state.theta if FLIP_THETA_FOR_VISUALIZATION else slam_state.theta,
+                    "robot_theta": slam_state.theta,
                     "left_speed": slam_state.left_speed,
                     "right_speed": slam_state.right_speed,
                     "linear_vel": slam_state.linear_vel,
